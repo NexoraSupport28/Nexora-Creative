@@ -1,0 +1,21 @@
+{
+  "name": "discord-bg-remover",
+  "version": "1.0.0",
+  "description": "Discord bot to remove image backgrounds",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@imgly/background-removal-node": "^1.4.3",
+    "axios": "^1.20.0",
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.3.1",
+    "sharp": "^0.35.4"
+  },
+  "overrides": {
+    "@imgly/background-removal-node": {
+      "sharp": "0.35.4"
+    }
+  }
+}
