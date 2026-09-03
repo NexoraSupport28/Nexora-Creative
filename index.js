@@ -34,7 +34,7 @@ const envInt = (name, fallback, min = 0) => {
   if (raw === undefined || raw === "") return fallback;
   const value = Number(raw);
   return Number.isFinite(value) && value >= min ? Math.floor(value) : fallback;
-}; 
+};
 const MAX_CONCURRENT_TASKS = envInt("MAX_CONCURRENT_TASKS", 20, 1);
 const MAX_WAITING_JOBS = envInt("MAX_WAITING_JOBS", 60, 1);
 const QUEUE_UPDATE_INTERVAL_MS = envInt("QUEUE_UPDATE_INTERVAL_MS", 4000, 0);
