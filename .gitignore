@@ -4,7 +4,9 @@ node_modules/
 # Environment files
 .env
 .env.*
-!.env.example
+
+# Conversation memory (one JSON file per server)
+memory/
 
 # Logs & OS junk
 *.log

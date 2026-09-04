@@ -69,7 +69,10 @@ const NEXORA_SYSTEM_PROMPT =
   "You are Nexora AI, a friendly and helpful AI assistant in a Discord server. " +
   "You can see and analyze the files users attach to the conversation " +
   "(images, audio, video, PDFs, Word/Excel/PowerPoint, and source code). " +
-  "Keep replies concise and natural, and answer in the same language the user writes in.";
+  "Detect the language the user writes in — and when files are attached, also " +
+  "consider the language of the file contents — then answer in that language " +
+  "(Indonesian stays Indonesian, English stays English). If no language can be " +
+  "clearly detected, answer in English. Keep replies concise and natural.";
 
 const AI_CHANNELS_FILE = path.join(__dirname, "aiChannels.json");
 
@@ -91,15 +94,236 @@ function saveAiChannels() {
 
 const aiChannels = loadAiChannels();
 
-// Per-guild chat memory for Nexora AI. Kept in RAM, capped per guild (see
-// MAX_HISTORY_MESSAGES), and wiped by /newtask so long chats stay light.
-const conversationMemory = new Map();
+// ---- Per-guild conversation memory (persisted to disk) --------------------
+// Chat history is stored as one JSON file per server inside the memory/
+// folder instead of RAM, so long conversations barely cost memory and they
+// survive bot restarts. Capped per guild (see MAX_HISTORY_MESSAGES) and wiped
+// by /newtask so long chats stay light.
+const MEMORY_DIR = path.join(__dirname, "memory");
+
+function memoryFilePath(guildId) {
+  return path.join(MEMORY_DIR, `${guildId}.json`);
+}
+
+// Load the remembered conversation for a guild (empty array when none yet).
+function loadConversation(guildId) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(memoryFilePath(guildId), "utf8"));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return []; // no file yet, unreadable, or corrupt -> start fresh
+  }
+}
+
+// Persist the conversation to disk (write to a temp file then rename, so a
+// crash mid-write can never corrupt the stored history).
+function saveConversation(guildId, history) {
+  try {
+    fs.mkdirSync(MEMORY_DIR, { recursive: true });
+    const file = memoryFilePath(guildId);
+    const tmp = `${file}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(history));
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    console.error(`⚠️ Failed to save conversation for guild ${guildId}:`, error.message);
+  }
+}
+
+// Forget a guild's stored conversation. Returns true when a file was removed.
+function deleteConversation(guildId) {
+  try {
+    const file = memoryFilePath(guildId);
+    if (fs.existsSync(file)) {
+      fs.unlinkSync(file);
+      return true;
+    }
+  } catch (error) {
+    console.error(`⚠️ Failed to delete conversation for guild ${guildId}:`, error.message);
+  }
+  return false;
+}
+
+// ---- Model health, rotation & rate-limit handling ---------------------------
+// Google's API can rate-limit a model (HTTP 429) or drop it entirely (HTTP
+// 404). Instead of failing the whole request the bot remembers each model's
+// state:
+//   • 429 -> model goes on a short cooldown honoring Google's "retry in Xs",
+//            and the request is handed to the next healthy model.
+//   • 404 -> model is marked unavailable and skipped for a while.
+// The start of the chain rotates on every request, so load is spread across
+// models instead of always hammering the first one.
+const MODEL_RECHECK_AFTER_MS = 60 * 60 * 1000; // re-check a 404'd model after 1h
+const MODEL_WAIT_CAP_MS = 120000; // never wait longer than this for a cooldown
+const modelHealth = new Map(); // model -> { retryAt, unavailableUntil }
+let modelRotation = 0;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Timestamp after which the model may be tried again (0 = healthy right now).
+function modelBlockedUntil(model) {
+  const health = modelHealth.get(model);
+  if (!health) return 0;
+  return Math.max(health.retryAt || 0, health.unavailableUntil || 0);
+}
+
+function markModelRateLimited(model, retrySeconds) {
+  const retryMs = Math.max(2000, (retrySeconds || 30) * 1000);
+  modelHealth.set(model, { ...(modelHealth.get(model) || {}), retryAt: Date.now() + retryMs });
+  console.log(`⏳ Model "${model}" rate-limited — skipping it for ${Math.round(retryMs / 1000)}s.`);
+}
+
+function markModelUnavailable(model) {
+  modelHealth.set(model, {
+    ...(modelHealth.get(model) || {}),
+    unavailableUntil: Date.now() + MODEL_RECHECK_AFTER_MS,
+  });
+  console.log(`🚫 Model "${model}" unavailable (404) — skipping it for ${MODEL_RECHECK_AFTER_MS / 60000} min.`);
+}
+
+// Models to try for this request: the chain rotated by one step (so every
+// request starts on a different model) minus any that are cooling down.
+function nextAttemptModels(models) {
+  const offset = modelRotation % Math.max(models.length, 1);
+  modelRotation += 1;
+  const rotated = [...models.slice(offset), ...models.slice(0, offset)];
+  return {
+    rotated,
+    ready: rotated.filter((model) => modelBlockedUntil(model) <= Date.now()),
+  };
+}
+
+// Read Google's suggested wait from a 429 response ("Please retry in 45.9s").
+function extractRetryDelaySeconds(error) {
+  const searchable = [
+    error?.response?.data ? JSON.stringify(error.response.data) : "",
+    error?.response?.headers?.["retry-after"] ?? "",
+    error?.message ?? "",
+  ].join(" ");
+  const match = searchable.match(/retry\s+in\s+([\d.]+)\s*s/i);
+  if (match) return Math.ceil(parseFloat(match[1]));
+  const header = Number(error?.response?.headers?.["retry-after"]);
+  return Number.isFinite(header) && header > 0 ? Math.ceil(header) : undefined;
+}
+
+// Wait until the earliest cooling-down model is available again (bounded by
+// MODEL_WAIT_CAP_MS so a stuck quota can never stall a request forever).
+async function waitForRateLimitRecovery(models) {
+  let earliest = Infinity;
+  for (const model of models) {
+    const blockedUntil = modelBlockedUntil(model);
+    if (blockedUntil > Date.now() && blockedUntil < earliest) earliest = blockedUntil;
+  }
+  const waitMs = Math.min(earliest - Date.now(), MODEL_WAIT_CAP_MS);
+  if (waitMs > 0) {
+    console.log(`⏳ All models cooling down — retrying in ${Math.round(waitMs / 1000)}s.`);
+    await sleep(waitMs);
+  }
+}
+
+// ---- Explicit language detection (Indonesian vs English) --------------------
+// Before asking Gemini we sample the user's message and any attached text/code
+// files, then pick the dominant language from characteristic stop words. The
+// result is passed to the model as an explicit instruction, so an Indonesian
+// file does not get answered in English (or vice versa) — and an undetectable
+// language simply falls back to the default (English).
+const LANG_SAMPLE_CHARS = 3000;
+const INDONESIAN_STOPWORDS = new Set([
+  "yang", "di", "ke", "dari", "ini", "itu", "untuk", "dengan", "dan", "atau",
+  "adalah", "tidak", "saya", "aku", "kamu", "kita", "kami", "mereka", "dia",
+  "pada", "akan", "sudah", "bisa", "dapat", "juga", "karena", "tapi", "kalau",
+  "jika", "apa", "bagaimana", "kenapa", "mengapa", "siapa", "kapan", "mana",
+  "mau", "ingin", "punya", "ada", "dalam", "sebagai", "seperti", "oleh",
+  "agar", "supaya", "sangat", "lebih", "kurang", "harus", "masih", "hanya",
+  "semua", "setiap", "beberapa", "yaitu", "yakni", "antara", "terhadap",
+  "tanpa", "setelah", "sebelum", "selama", "sejak", "ketika", "saat",
+  "mungkin", "pernah", "sedang", "lagi", "jangan", "bilang", "kasih",
+  "minta", "tolong", "wok", "bro", "gan", "kak", "bang", "nih", "deh",
+  "dong", "yah", "ya", "gk", "ga", "nggak", "gak", "udah", "dah", "gimana",
+  "kok", "loh", "lah", "sih", "tuh", "gitu", "gini", "aja", "doang", "biar",
+  "bikin", "buat", "coba", "sama", "lain", "banyak", "sedikit", "bagus",
+  "mantap", "keren", "gampang", "mudah", "susah", "sulit", "cepat", "lambat",
+  "hari", "malam", "pagi", "siang", "sore", "kemarin", "besok", "sekarang",
+  "tadi", "nanti", "disini", "disitu", "kesini", "kesitu", "disana", "kesana",
+  "dulu", "kali", "rasanya", "kayaknya", "sepertinya", "cuma", "kok", "bgt",
+]);
+const ENGLISH_STOPWORDS = new Set([
+  "the", "is", "are", "was", "were", "be", "been", "being", "and", "or", "of",
+  "to", "in", "on", "for", "with", "by", "from", "at", "as", "an", "a", "it",
+  "this", "that", "these", "those", "i", "you", "we", "they", "he", "she",
+  "have", "has", "had", "do", "does", "did", "will", "would", "can", "could",
+  "should", "may", "might", "must", "shall", "not", "but", "because", "if",
+  "then", "so", "such", "than", "too", "what", "how", "why", "when", "where",
+  "who", "which", "whose", "please", "thanks", "thank", "yes", "no", "also",
+  "very", "more", "less", "most", "only", "just", "about", "into", "over",
+  "under", "between", "during", "after", "before", "while", "up", "down",
+  "out", "off", "again", "once", "here", "there", "all", "any", "both",
+  "each", "few", "other", "some", "same", "own", "am", "me", "my", "your",
+  "our", "their", "his", "her", "them", "us", "would", "could", "really",
+  "actually", "maybe", "okay", "ok", "sure", "yes", "please", "help",
+]);
+
+function tokenizeForLanguage(text) {
+  return (text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((word) => word.length > 1);
+}
+
+// Returns "indonesian", "english", or null when the language is unclear.
+function detectLanguageOfText(text) {
+  const tokens = tokenizeForLanguage((text || "").slice(0, LANG_SAMPLE_CHARS * 4));
+  if (tokens.length === 0) return null;
+  let indonesian = 0;
+  let english = 0;
+  for (const token of tokens) {
+    if (INDONESIAN_STOPWORDS.has(token)) indonesian += 1;
+    else if (ENGLISH_STOPWORDS.has(token)) english += 1;
+  }
+  const total = tokens.length;
+  const idRatio = indonesian / total;
+  const enRatio = english / total;
+  if (idRatio > 0.02 && indonesian >= 2 && indonesian > english) return "indonesian";
+  if (enRatio > 0.03 && english >= 3 && english > indonesian) return "english";
+  if (indonesian > english && indonesian >= 3) return "indonesian";
+  if (english > indonesian && english >= 3) return "english";
+  return null;
+}
+
+// Sample the user message plus any attached text/code files (their real
+// content), then run the detector over the combined sample.
+async function detectLanguageOfRequest(userText, attachments) {
+  const samples = [(userText || "").trim()];
+  for (const attachment of attachments || []) {
+    const displayName = attachment.name || "file";
+    const ext = path.extname(displayName).slice(1).toLowerCase();
+    const mime = normalizeAttachmentMime(attachment, ext);
+    const kind = classifyAttachmentFile(mime, ext, displayName.toLowerCase());
+    if (kind !== "text") continue; // binary media/docs are read by the model itself
+    try {
+      const buffer = await downloadFile(attachment.url);
+      samples.push(buffer.toString("utf8").slice(0, LANG_SAMPLE_CHARS));
+    } catch (error) {
+      console.warn("⚠️ Could not sample attachment for language detection:", error.message);
+    }
+  }
+  const combined = samples.join(" ");
+  if (!combined.trim()) return null;
+  return detectLanguageOfText(combined);
+}
+
+// Default analysis prompt, phrased in the detected language.
+function defaultAnalysisPrompt(detectedLanguage) {
+  return detectedLanguage === "indonesian"
+    ? "Tolong analisis file yang dilampirkan, lalu jawab dalam bahasa Indonesia."
+    : "Please analyze the attached file(s).";
+}
 
 // Ask Google Gemini to generate a reply for the given user text, using the
 // remembered conversation history (per guild) for context. Attachments are
 // analyzed in the same request (see buildUserTurnParts). Models are tried in
-// order until one answers, so the chat keeps working if one model is retired,
-// blocked, or rate-limited.
+// a rotating order until one answers; rate-limited (429) and unavailable
+// (404) models are handled so the chat survives quota hits and retired models.
 async function askGemini(guildId, text, options = {}) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -113,20 +337,37 @@ async function askGemini(guildId, text, options = {}) {
     timeoutMs = 60000,
   } = options;
 
+  // Detect the dominant language (user message + attached text files) so the
+  // model is told explicitly which language to reply in.
+  const detectedLanguage = await detectLanguageOfRequest(text, attachments);
+  const languageInstruction =
+    detectedLanguage === "indonesian"
+      ? "IMPORTANT: The user's message and/or attached files are in Indonesian — reply in Indonesian."
+      : detectedLanguage === "english"
+        ? "IMPORTANT: The user's message and/or attached files are in English — reply in English."
+        : null;
+  const systemInstructionParts = [{ text: NEXORA_SYSTEM_PROMPT }];
+  if (languageInstruction) systemInstructionParts.push({ text: languageInstruction });
+
   // Build contents from the remembered history + the new message. History
   // always alternates user/model because both sides are stored in pairs and
   // only ever contains text (files travel with a single message and are not
   // remembered across turns, which keeps memory light).
   const contents = [];
   if (includeHistory) {
-    const history = conversationMemory.get(guildId) || [];
+    const history = loadConversation(guildId);
     for (const entry of history) {
       contents.push({ role: entry.role, parts: [{ text: entry.text }] });
     }
   }
   // The user's current turn: instruction text plus Gemini parts for every
   // attached file (images/audio/video/documents inline, text/code as text).
-  const userParts = await buildUserTurnParts(text, attachments);
+  // When the user only attached files without writing anything, use a default
+  // prompt phrased in the detected language.
+  const effectiveText =
+    (text || "").trim() ||
+    (attachments.length > 0 ? defaultAnalysisPrompt(detectedLanguage) : (text || ""));
+  const userParts = await buildUserTurnParts(effectiveText, attachments);
   contents.push({ role: "user", parts: userParts });
 
   // Analyzing audio/video/documents takes longer than plain text.
@@ -134,33 +375,60 @@ async function askGemini(guildId, text, options = {}) {
     attachments.length > 0 ? Math.max(timeoutMs, 180000) : timeoutMs;
 
   const failures = [];
-  for (const model of GEMINI_MODELS) {
-    try {
-      const response = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-        {
-          systemInstruction: { parts: [{ text: NEXORA_SYSTEM_PROMPT }] },
-          contents,
-          generationConfig: { maxOutputTokens, temperature: 0.7 },
-        },
-        { timeout: effectiveTimeout }
-      );
-      const reply = response.data?.candidates?.[0]?.content?.parts
-        ?.map((part) => part.text ?? "")
-        .join("")
-        .trim();
-      if (!reply) {
-        throw new Error("Gemini returned an empty response");
+  const deadline = Date.now() + MODEL_WAIT_CAP_MS;
+  while (Date.now() < deadline) {
+    const { ready } = nextAttemptModels(GEMINI_MODELS);
+    // Try the healthy models (rotated); fall back to the whole chain when
+    // everything is cooling down (blocked ones are skipped inside the loop).
+    const queue = ready.length > 0 ? ready : GEMINI_MODELS;
+    let attempted = false;
+    for (const model of queue) {
+      if (modelBlockedUntil(model) > Date.now()) continue;
+      attempted = true;
+      try {
+        const response = await axios.post(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+          {
+            systemInstruction: { parts: systemInstructionParts },
+            contents,
+            generationConfig: { maxOutputTokens, temperature: 0.7 },
+          },
+          { timeout: effectiveTimeout }
+        );
+        const reply = response.data?.candidates?.[0]?.content?.parts
+          ?.map((part) => part.text ?? "")
+          .join("")
+          .trim();
+        if (!reply) {
+          throw new Error("Gemini returned an empty response");
+        }
+        return { reply, model };
+      } catch (error) {
+        const status = error.response?.status;
+        const detail = error.response?.data?.error?.message || error.message;
+        failures.push(`${model}: ${status ? `HTTP ${status}` : "network"} — ${detail}`);
+        if (status === 429) {
+          // Rate limited: cool this model down and let the next one try.
+          markModelRateLimited(model, extractRetryDelaySeconds(error));
+        } else if (status === 404) {
+          // Model retired / not enabled: stop wasting requests on it.
+          markModelUnavailable(model);
+        } else {
+          console.warn(`⚠️ Model "${model}" failed${status ? ` (HTTP ${status})` : ""}: ${detail}`);
+        }
       }
-      return { reply, model };
-    } catch (error) {
-      // axios hides the real reason behind "Request failed with status code 403".
-      // Surface Google's actual message (invalid key, suspended project, quota,
-      // retired model, ...) so logs point at the true cause.
-      const status = error.response?.status;
-      const detail = error.response?.data?.error?.message || error.message;
-      failures.push(`${model}: ${status ? `HTTP ${status}` : "network"} — ${detail}`);
-      console.warn(`⚠️ Model "${model}" failed${status ? ` (HTTP ${status})` : ""}: ${detail}`);
+    }
+    if (!attempted) {
+      // Everyone is cooling down — wait for the earliest recovery, then retry.
+      await waitForRateLimitRecovery(GEMINI_MODELS);
+    } else {
+      const allCooling = queue.every((model) => modelBlockedUntil(model) > Date.now());
+      if (allCooling) {
+        await waitForRateLimitRecovery(GEMINI_MODELS);
+      } else {
+        // Healthy models failed for other reasons: brief pause, then retry.
+        await sleep(1000);
+      }
     }
   }
 
@@ -454,33 +722,57 @@ async function generateImageFromPrompt(prompt, referenceParts = []) {
   const parts = [{ text: prompt }, ...referenceParts];
 
   const failures = [];
-  for (const model of IMAGE_MODELS) {
-    try {
-      const response = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-        {
-          contents: [{ role: "user", parts }],
-          generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
-        },
-        { timeout: IMAGE_GENERATION_TIMEOUT_MS }
-      );
-      // Safety filters return no candidate but report promptFeedback.
-      const blocked = response.data?.promptFeedback?.blockReason;
-      if (blocked) throw new Error(`Request blocked by safety filters (${blocked})`);
-      const parts = response.data?.candidates?.[0]?.content?.parts || [];
-      for (const part of parts) {
-        const mime = part.inlineData?.mimeType;
-        const data = part.inlineData?.data;
-        if (mime && data && mime.startsWith("image/")) {
-          return { buffer: Buffer.from(data, "base64"), mime, model };
+  const deadline = Date.now() + MODEL_WAIT_CAP_MS;
+  while (Date.now() < deadline) {
+    const { ready } = nextAttemptModels(IMAGE_MODELS);
+    const queue = ready.length > 0 ? ready : IMAGE_MODELS;
+    let attempted = false;
+    for (const model of queue) {
+      if (modelBlockedUntil(model) > Date.now()) continue;
+      attempted = true;
+      try {
+        const response = await axios.post(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+          {
+            contents: [{ role: "user", parts }],
+            generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
+          },
+          { timeout: IMAGE_GENERATION_TIMEOUT_MS }
+        );
+        // Safety filters return no candidate but report promptFeedback.
+        const blocked = response.data?.promptFeedback?.blockReason;
+        if (blocked) throw new Error(`Request blocked by safety filters (${blocked})`);
+        const contentParts = response.data?.candidates?.[0]?.content?.parts || [];
+        for (const part of contentParts) {
+          const mime = part.inlineData?.mimeType;
+          const data = part.inlineData?.data;
+          if (mime && data && mime.startsWith("image/")) {
+            return { buffer: Buffer.from(data, "base64"), mime, model };
+          }
+        }
+        throw new Error("Model returned no image");
+      } catch (error) {
+        const status = error.response?.status;
+        const detail = error.response?.data?.error?.message || error.message;
+        failures.push(`${model}: ${status ? `HTTP ${status}` : "network"} — ${detail}`);
+        if (status === 429) {
+          markModelRateLimited(model, extractRetryDelaySeconds(error));
+        } else if (status === 404) {
+          markModelUnavailable(model);
+        } else {
+          console.warn(`🎨 Image model "${model}" failed${status ? ` (HTTP ${status})` : ""}: ${detail}`);
         }
       }
-      throw new Error("Model returned no image");
-    } catch (error) {
-      const status = error.response?.status;
-      const detail = error.response?.data?.error?.message || error.message;
-      failures.push(`${model}: ${status ? `HTTP ${status}` : "network"} — ${detail}`);
-      console.warn(`🎨 Image model "${model}" failed${status ? ` (HTTP ${status})` : ""}: ${detail}`);
+    }
+    if (!attempted) {
+      await waitForRateLimitRecovery(IMAGE_MODELS);
+    } else {
+      const allCooling = queue.every((model) => modelBlockedUntil(model) > Date.now());
+      if (allCooling) {
+        await waitForRateLimitRecovery(IMAGE_MODELS);
+      } else {
+        await sleep(1000);
+      }
     }
   }
 
@@ -535,6 +827,22 @@ const IMAGE_EDIT_PATTERNS = [
 function looksLikeImageEditRequest(text) {
   const trimmed = (text || "").trim();
   return IMAGE_EDIT_PATTERNS.some((pattern) => pattern.test(trimmed));
+}
+
+// Bare imperative "gambar kucing" / "gambarin naga" (no verb "buatkan") means
+// "draw/create". Guarded so questions about an existing image ("gambar ini
+// apa?", "gambar kucing itu lucu ya") are never hijacked.
+function looksLikeBareImageRequest(text) {
+  const t = (text || "").trim();
+  if (!/^(?:gambar|gambarin)\s/i.test(t)) return false;
+  if (
+    t.length > 120 ||
+    /\?/.test(t) ||
+    /\b(?:ini|itu|apa|yang|yg|mana|tersebut|tsb|dia|nih)\b/.test(t)
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function imageGenerationErrorMessage(error) {
@@ -1246,7 +1554,9 @@ function looksLikeRemoveBgRequest(text) {
     /\bremovebg\b/i.test(t) ||
     /\b(?:hapus|buang|hilangkan|ilangin)\s+(?:background|bg|latar(?:\s+belakang)?)(?:nya)?\b/i.test(t) ||
     /\b(?:background|bg|latar(?:\s+belakang)?)(?:nya)?\s+(?:di)?hapus\b/i.test(t) ||
-    /\b(?:background|latar(?:\s+belakang)?)\s*remover\b/i.test(t)
+    /\b(?:background|latar(?:\s+belakang)?)\s*remover\b/i.test(t) ||
+    /\b(?:buat|bikin|jadikan?|ubah)\s+(?:background|bg|latar(?:\s+belakang)?)?\s*transparan\b/i.test(t) ||
+    /\b(?:background|bg|latar(?:\s+belakang)?)\s+transparan\b/i.test(t)
   );
 }
 
@@ -1453,7 +1763,7 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   if (interaction.commandName === "newtask") {
-    const cleared = conversationMemory.delete(interaction.guildId);
+    const cleared = deleteConversation(interaction.guildId);
     await interaction.reply({
       content: cleared
         ? "🧹 **Nexora AI** memory cleared — starting a fresh conversation!"
@@ -1514,25 +1824,233 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
+// ---- Bot commands spoken in plain chat --------------------------------------
+// In an AI channel the real bot commands can be run by just typing them:
+// "status" shows the live status panel, "newtask"/"reset" clears the chat
+// memory, "help"/"bantuan" lists everything. Patterns are deliberately strict
+// so normal conversation (e.g. "apa itu status error?") is never hijacked.
+const HELP_TEXT =
+  "📋 **Available Commands:**\n" +
+  "`/removebg` - Remove background from an image\n" +
+  "`/status` - Check bot status (latency, CPU, RAM, uptime)\n" +
+  "`/set` - Turn this channel into a Nexora AI chat channel\n" +
+  "`/newtask` - Forget the current Nexora AI chat and start fresh\n" +
+  "`/analyze` - Analyze any file (image, mp4, mp3, PDF, Word, PPTX, Excel, code...)\n" +
+  "`/imagine` - Generate an image from a description; attach a reference image to edit it\n" +
+  "💡 In an AI chat channel (`/set`) you can also just attach a file with your " +
+  "message and Nexora will analyze it, write e.g. `buatkan gambar kucing` to " +
+  "generate one, attach a photo + `ubah latarnya jadi pantai` to edit it, or " +
+  "attach a photo + `hapus background` to remove its background!\n" +
+  "💬 In an AI chat channel plain text also runs commands: `status`/`ping`, " +
+  "`newtask`/`reset`, `riwayat` (downloads this server's chat history), " +
+  "`set off`/`matikan nexora`, and `help`/`bantuan`. Paste a file link to " +
+  "analyze it, type `gambar kucing` to draw one, attach a photo + `hapus " +
+  "background`/`buat transparan`, or `ubah latarnya jadi pantai` to edit it.";
+
+// Match a short, command-like chat message to a real bot command, or null.
+function extractChatCommand(text) {
+  const t = (text || "").trim().toLowerCase().replace(/[.!,?]+$/, "");
+  if (!t || t.length > 60) return null;
+  if (
+    /^(?:tolong\s+|bisa\s+|cek(?:in)?\s+|lihat\s+|show\s+|check\s+|bot\s+|kasih\s+)?(?:status|stats?|statistik|keadaan)(?:\s+bot)?(?:nya)?(?:\s+(?:sekarang|dong|yuk|dulu))?$/.test(t) ||
+    /^(?:cek\s+|bot\s+)?(?:ping|latensi|lag)$/.test(t)
+  ) {
+    return "status";
+  }
+  if (
+    /^\/?newtask$/.test(t) ||
+    /^\/?(?:reset(?:\s+(?:percakapan|chat|riwayat|memory))?|mulai\s+baru|start\s+fresh|hapus\s+riwayat|lupakan\s+percakapan|clear\s+(?:chat|memory|percakapan|riwayat)|bersihkan\s+(?:memori|chat|percakapan)|buang\s+memori)$/.test(t)
+  ) {
+    return "newtask";
+  }
+  if (
+    /^(?:set\s+off|off|matikan\s+nexora|matikan\s+ai|nexora\s+off|nonaktifkan\s+(?:nexora|ai)|turn\s+off\s+(?:nexora|ai))$/.test(t)
+  ) {
+    return "setoff";
+  }
+  if (
+    /^(?:riwayat(?:(?:\s+(?:chat|percakapan)))?|log\s+chat|chat\s+history|history|unduh\s+riwayat|download\s+(?:chat\s+)?history|ambil\s+riwayat)$/.test(t)
+  ) {
+    return "history";
+  }
+  if (/^(?:help|bantuan|command|commands|daftar\s+command|daftar\s+perintah)$/.test(t)) {
+    return "help";
+  }
+  return null;
+}
+
+// Execute a command the user asked for in plain text. Returns true when it
+// handled the message, so the caller does not also send it to Gemini.
+async function handleChatCommand(message, text) {
+  const command = extractChatCommand(text);
+  if (!command) return false;
+  console.log(`🕹️ Executing chat command "${command}" (guild ${message.guildId})`);
+  try {
+    await message.channel.sendTyping();
+    if (command === "status") {
+      await message.reply({
+        embeds: [await statusEmbed()],
+        components: [statusActionRow()],
+      });
+    } else if (command === "newtask") {
+      const cleared = deleteConversation(message.guildId);
+      await message.reply(
+        cleared
+          ? "🧹 **Nexora AI** memory cleared — starting a fresh conversation!"
+          : "🧹 Nexora AI memory is already empty — nothing to forget."
+      );
+    } else if (command === "setoff") {
+      aiChannels.delete(message.guildId);
+      saveAiChannels();
+      await message.reply(
+        "🛑 **Nexora AI** has been turned off in this server — I'll stop replying here. " +
+          "Use `/set module: Nexora AI` in any channel to turn me back on."
+      );
+    } else if (command === "history") {
+      const history = loadConversation(message.guildId);
+      if (history.length === 0) {
+        await message.reply(
+          "📭 No conversation history saved for this server yet — chat with me first!"
+        );
+      } else {
+        const transcript = history
+          .map(
+            (entry) =>
+              `${entry.role === "user" ? "👤 User" : "🤖 Nexora"}: ${entry.text}`
+          )
+          .join("\n\n──────────────────\n\n");
+        const attachment = new AttachmentBuilder(
+          Buffer.from(transcript, "utf8"),
+          { name: `nexora_history_${message.guildId}.txt` }
+        );
+        await message.reply({
+          content: `📜 Here's the saved conversation history for this server (${history.length} messages).`,
+          files: [attachment],
+        });
+      }
+    } else if (command === "help") {
+      await message.reply(HELP_TEXT);
+    }
+  } catch (error) {
+    console.error(`❌ Chat command "${command}" failed:`, error.message);
+    await message
+      .reply(`⚠️ Failed to run \`${command}\` — please try again.`)
+      .catch(() => {});
+  }
+  return true;
+}
+
+// Send a Gemini chat answer to a message, remembering both sides on disk
+// (memory/<guildId>.json) and splitting long replies into multiple messages.
+// Shared by attached-file analysis and URL analysis.
+async function storeAndSendChatReply(message, guildId, text, attachments, reply, model) {
+  const history = loadConversation(guildId);
+  const userText =
+    (text || "").trim() ||
+    (attachments.length > 0
+      ? `(asked me to look at ${attachments.length} attached file${attachments.length > 1 ? "s" : ""})`
+      : "");
+  history.push({ role: "user", text: userText }, { role: "model", text: reply });
+  while (history.length > MAX_HISTORY_MESSAGES) history.shift();
+  saveConversation(guildId, history);
+  if (model !== GEMINI_MODELS[0]) {
+    console.log(`🤖 Nexora AI answered with fallback model: ${model}`);
+  }
+  const chunks = splitLongText(reply);
+  await message.reply(chunks[0]);
+  for (const chunk of chunks.slice(1)) {
+    await message.channel.send(chunk);
+  }
+}
+
+// ---- Analyzing files from plain URLs ----------------------------------------
+// Pasting a link to an image/PDF/video/etc. (instead of attaching) works too:
+// the file is downloaded and analyzed just like an attachment.
+const ANALYZE_LINK_INTENT =
+  /(?:analis|analy[sz]|ringkas|summari[sz]|jelaskan|baca(?:kan)?|lihat(?:in)?|cek|check|apa\s+isi|terjemahkan|translate|buka|open)/i;
+
+function isOnlyUrls(text) {
+  return /^(?:https?:\/\/\S+\s*)+$/i.test((text || "").trim());
+}
+
+// Find URLs in a message that point directly to analyzable files
+// (image/audio/video/document/code extensions).
+function extractFileUrls(text) {
+  const matches = (text || "").match(/https?:\/\/[^\s<>"']+/gi) || [];
+  const found = [];
+  for (let raw of matches) {
+    raw = raw.replace(/[)\]}>.,;]+$/, "");
+    try {
+      const pathname = new URL(raw).pathname;
+      const name = decodeURIComponent(pathname.split("/").pop() || "");
+      const ext = path.extname(name).slice(1).toLowerCase();
+      if (name && (TEXT_FILE_EXTENSIONS.has(ext) || EXTENSION_MIME[ext])) {
+        found.push({ name, url: raw });
+      }
+    } catch {
+      /* ignore malformed URLs */
+    }
+  }
+  return found;
+}
+
+// Treat a message as a "analyze this link" request when it contains file URLs
+// and either an analysis word or is nothing but URLs.
+function looksLikeAnalyzeLinkRequest(text) {
+  const t = (text || "").trim();
+  if (!t || t.length > 1500) return false;
+  return extractFileUrls(t).length > 0 && (ANALYZE_LINK_INTENT.test(t) || isOnlyUrls(t));
+}
+
+// Download and analyze files referenced by URL(s) in a chat message.
+async function analyzeFileLinksInChat(message, text) {
+  const refs = extractFileUrls(text);
+  if (refs.length === 0) return false;
+  try {
+    // Real size is unknown until download, so report 0 here and let
+    // prepareAttachmentParts double-check the downloaded bytes against the limit.
+    const pseudoAttachments = refs.map((ref) => ({
+      name: ref.name,
+      size: 0,
+      contentType:
+        EXTENSION_MIME[path.extname(ref.name).slice(1).toLowerCase()] ||
+        "application/octet-stream",
+      url: ref.url,
+    }));
+    console.log(`🔗 Analyzing ${refs.length} file URL(s)...`);
+    const { reply, model } = await askGemini(message.guildId, text, {
+      attachments: pseudoAttachments,
+    });
+    await storeAndSendChatReply(
+      message,
+      message.guildId,
+      text,
+      pseudoAttachments,
+      reply,
+      model
+    );
+    return true;
+  } catch (error) {
+    console.error("❌ URL analysis error:", error.message);
+    const message_ = error.message || String(error);
+    await message
+      .reply(
+        error.isAnalysis || message_.startsWith("❌")
+          ? message_
+          : `❌ Could not analyze that link: ${message_}`
+      )
+      .catch(() => {});
+    return true;
+  }
+}
+
 // Handle prefix commands (optional - for simplicity)
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
 
   // Simple help command
   if (message.content === "!help") {
-    return message.reply(
-      "📋 **Available Commands:**\n" +
-        "`/removebg` - Remove background from an image\n" +
-        "`/status` - Check bot status (latency, CPU, RAM, uptime)\n" +
-        "`/set` - Turn this channel into a Nexora AI chat channel\n" +
-        "`/newtask` - Forget the current Nexora AI chat and start fresh\n" +
-        "`/analyze` - Analyze any file (image, mp4, mp3, PDF, Word, PPTX, Excel, code...)\n" +
-        "`/imagine` - Generate an image from a description; attach a reference image to edit it\n" +
-        "💡 In an AI chat channel (`/set`) you can also just attach a file with your " +
-        "message and Nexora will analyze it, write e.g. `buatkan gambar kucing` to " +
-        "generate one, attach a photo + `ubah latarnya jadi pantai` to edit it, or " +
-        "attach a photo + `hapus background` to remove its background!"
-    );
+    return message.reply(HELP_TEXT);
   }
 
   // Nexora AI: reply to every message in a registered chat channel. Text-only
@@ -1560,13 +2078,25 @@ client.on("messageCreate", async (message) => {
         return;
       }
 
-      // Image requests ("buatkan gambar ...", "/imagine ...", ...) are routed to
-      // the dedicated image-generation model. If images are attached they are
-      // used as references, so the prompt becomes an editing instruction
-      // (e.g. attach a photo + "ubah latarnya jadi pantai").
+      // Real bot commands spoken as plain text: "status", "newtask", "help",
+      // "riwayat", "set off", ...
+      if (await handleChatCommand(message, text)) return;
+
+      // Files pasted as URLs ("analisis link ini ..." or a bare file link)
+      // are downloaded and analyzed just like attachments.
+      if (attachments.length === 0 && looksLikeAnalyzeLinkRequest(text)) {
+        if (await analyzeFileLinksInChat(message, text)) return;
+      }
+
+      // Image requests ("buatkan gambar ...", "gambar kucing", "/imagine ...",
+      // ...) are routed to the dedicated image-generation model. If images are
+      // attached they are used as references, so the prompt becomes an editing
+      // instruction (e.g. attach a photo + "ubah latarnya jadi pantai").
       const wantsImageEdit =
         attachments.length > 0 && looksLikeImageEditRequest(text);
-      if (text && (looksLikeImageRequest(text) || wantsImageEdit)) {
+      const wantsImageGen =
+        looksLikeImageRequest(text) || looksLikeBareImageRequest(text);
+      if (text && (wantsImageGen || wantsImageEdit)) {
         const prompt = text.replace(/^\/imagine\b/, "").trim() || text;
         const referenceParts = attachments.length > 0 ? await prepareImageReferenceParts(attachments) : [];
         const { buffer, mime, model } = await generateImageFromPrompt(prompt, referenceParts);
@@ -1583,25 +2113,10 @@ client.on("messageCreate", async (message) => {
       }
 
       const { reply, model } = await askGemini(message.guildId, text, { attachments });
-      // Remember both sides so the next message has full context. Attachments
-      // are not stored in memory — only the text the user wrote.
-      const history = conversationMemory.get(message.guildId) || [];
-      const userText =
-        text ||
-        (attachments.length > 0
-          ? `(asked me to look at ${attachments.length} attached file${attachments.length > 1 ? "s" : ""})`
-          : "");
-      history.push({ role: "user", text: userText }, { role: "model", text: reply });
-      while (history.length > MAX_HISTORY_MESSAGES) history.shift();
-      conversationMemory.set(message.guildId, history);
-      if (model !== GEMINI_MODELS[0]) {
-        console.log(`🤖 Nexora AI answered with fallback model: ${model}`);
-      }
-      const chunks = splitLongText(reply);
-      await message.reply(chunks[0]);
-      for (const chunk of chunks.slice(1)) {
-        await message.channel.send(chunk);
-      }
+      // Remember both sides so the next message has full context — stored on
+      // disk (memory/<guildId>.json), not RAM. Attachments are not stored —
+      // only the text the user wrote.
+      await storeAndSendChatReply(message, message.guildId, text, attachments, reply, model);
     } catch (error) {
       console.error("❌ Nexora AI error:", error.message);
       const message_ = error.message || String(error);
