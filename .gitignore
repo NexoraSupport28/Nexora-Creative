@@ -8,6 +8,9 @@ node_modules/
 # Conversation memory (one JSON file per server)
 memory/
 
+# Support ticket runtime state (panel message id + open tickets)
+supportData.json
+
 # Logs & OS junk
 *.log
 .DS_Store

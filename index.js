@@ -12,6 +12,9 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  StringSelectMenuBuilder,
+  ChannelType,
+  PermissionFlagsBits,
   Status,
 } = require("discord.js");
 const axios = require("axios");
@@ -1001,14 +1004,15 @@ const commands = [
     .setDescription("Check bot status: latency, CPU, RAM, uptime, and more"),
   new SlashCommandBuilder()
     .setName("set")
-    .setDescription("Turn this channel into an AI chat channel")
+    .setDescription("Set this channel's role: Nexora AI chat or Support Panel")
     .addStringOption((option) =>
       option
         .setName("module")
-        .setDescription("The module to enable in this channel")
+        .setDescription("The module to set up in this channel")
         .setRequired(true)
         .addChoices(
           { name: "Nexora AI", value: "nexora_ai" },
+          { name: "Support Panel", value: "support_panel" },
           { name: "Off", value: "off" }
         )
     ),
@@ -1674,6 +1678,566 @@ async function enqueueRequest(interaction, attachment) {
   }
 }
 
+// ---- Support ticket system --------------------------------------------------
+// The support panel is never posted automatically: it only appears when an
+// allowed manager (SUPPORT_PANEL_MANAGER_IDS) runs `/set module: Support
+// Panel` in the channel where the panel should live. Only members who hold
+// SUPPORT_ROLE_ID (or any role positioned above it in the role hierarchy) may
+// press its "Support" button, pick a topic, and a PRIVATE thread opens that
+// only the ticket owner can see and write in. The first
+// (top) message of the thread is a panel that says to wait
+// for a moderator, pings SUPPORT_NOTIFY_MOD_ID + the owner, and carries a
+// "Close Ticket" button that deletes the thread. Runtime state (panel message
+// id + open tickets) is persisted to supportData.json so restarts never
+// duplicate a panel or lose track of open tickets.
+const SUPPORT_PANEL_MANAGER_IDS = new Set(["1523184178567581817", "1280789307027755019"]); // who may run "/set module: Support Panel"
+const SUPPORT_ROLE_ID = "1522552781268058122"; // role that may press "Support" — or any role above it (hierarchy)
+// Staff role IDs used for the "Close Ticket" permission check. Members are no
+// longer auto-added to tickets (Discord rejects role IDs on that endpoint).
+const SUPPORT_STAFF_IDS = [
+  // staff roles that may close tickets
+  "1523184178567581817",
+  "1522552841716371606",
+  "1522552815162097774",
+  "1523629873069822022",
+  "1544956355398336565",
+];
+const SUPPORT_NOTIFY_MOD_ID = "1523184178567581817"; // role (or user) pinged at the top of each ticket
+
+// Ticket topics shown in the dropdown when someone presses "Support". Each has
+// its own accent color used across the ticket UI.
+const SUPPORT_CATEGORIES = [
+  { value: "general", label: "General Help", emoji: "💬", description: "Questions about the server or bot", color: 0x3b82f6 },
+  { value: "technical", label: "Technical Issue", emoji: "🔧", description: "Bugs, errors, technical problems", color: 0xf59e0b },
+  { value: "other", label: "Other", emoji: "📦", description: "Anything else", color: 0x8b5cf6 },
+];
+
+function categoryByValue(value) {
+  return SUPPORT_CATEGORIES.find((c) => c.value === value) || null;
+}
+
+// Short, human-friendly ticket code shown in the ticket and confirmations
+// (e.g. T-7K2MXQ). No confusing 0/O or 1/I characters.
+function generateTicketId() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let id = "";
+  for (let i = 0; i < 6; i++) id += chars[Math.floor(Math.random() * chars.length)];
+  return `T-${id}`;
+}
+
+function formatDuration(ms) {
+  const totalMinutes = Math.floor(ms / 60000);
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  const parts = [];
+  if (days) parts.push(`${days}d`);
+  if (hours) parts.push(`${hours}h`);
+  if (minutes) parts.push(`${minutes}m`);
+  return parts.join(" ") || "< 1m";
+}
+
+// A configured ID may be a user ID or a role ID — match either one. A member
+// qualifies when they ARE the user or they HOLD the role.
+function memberMatchesAny(member, ids) {
+  if (!member) return false;
+  const roles = member.roles?.cache;
+  return (ids || []).some((id) => member.id === id || (roles && roles.has(id)));
+}
+const SUPPORT_COLOR = 0x3b82f6;
+const SUPPORT_DATA_FILE = path.join(__dirname, "supportData.json");
+
+const supportState = loadSupportState();
+
+function loadSupportState() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SUPPORT_DATA_FILE, "utf8"));
+    return {
+      panel: parsed?.panel || null,
+      tickets:
+        parsed?.tickets && typeof parsed.tickets === "object" ? parsed.tickets : {},
+    };
+  } catch {
+    return { panel: null, tickets: {} }; // no file yet or unreadable -> start empty
+  }
+}
+
+function saveSupportState() {
+  try {
+    fs.writeFileSync(SUPPORT_DATA_FILE, JSON.stringify(supportState, null, 2));
+  } catch (error) {
+    console.error("⚠️ Failed to save support ticket state:", error.message);
+  }
+}
+
+// Look up a user's open ticket thread, cleaning up the stored record
+// automatically when the thread no longer exists.
+async function findOpenTicket(guildId, userId) {
+  const record = supportState.tickets?.[guildId]?.[userId];
+  if (!record) return null;
+  const thread = await client.channels.fetch(record.threadId, { force: true }).catch(() => null);
+  if (!thread) {
+    delete supportState.tickets[guildId][userId];
+    if (Object.keys(supportState.tickets[guildId]).length === 0) {
+      delete supportState.tickets[guildId];
+    }
+    saveSupportState();
+    return null;
+  }
+  return thread;
+}
+
+// Discord forbids a few characters in thread names, so scrub them from the
+// username — a weird name can never make thread creation fail.
+function supportThreadName(user, category) {
+  const clean = (user.username || "User")
+    .replace(/[\u0000-\u001F\u007F<>:"\/\\|?*#@]/g, "")
+    .trim();
+  const prefix = category ? `${category.emoji} ${category.label}` : "📞 Support";
+  return `${prefix} · ${clean || "User"}`.slice(0, 100);
+}
+
+// Build the reusable support panel content (embed + "Support"/"FAQ" buttons).
+function supportPanelPayload() {
+  const panelEmbed = new EmbedBuilder()
+    .setColor(SUPPORT_COLOR)
+    .setTitle("🛟 Support Center")
+    .setDescription(
+      "Need help or have a question? We're here for you — and it only takes a moment to get started."
+    )
+    .addFields(
+      {
+        name: "📩 How to get help",
+        value:
+          "Press the **Support** button, pick a topic, and a **private ticket** opens automatically. A moderator will reply as soon as possible.",
+      },
+      { name: "🕐 Response time", value: "Usually within a few hours.", inline: true },
+      { name: "🔒 Privacy", value: "Only you and the support team can see your ticket.", inline: true },
+      { name: "❓ Quick answers", value: "Press **FAQ** below for common questions.", inline: true }
+    )
+    .setFooter({ text: "Please only open a ticket when you actually need help." });
+  const panelRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("support_open")
+      .setLabel("Support")
+      .setEmoji("📩")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId("support_faq")
+      .setLabel("FAQ")
+      .setEmoji("❓")
+      .setStyle(ButtonStyle.Secondary)
+  );
+  return { embeds: [panelEmbed], components: [panelRow] };
+}
+
+// "FAQ" button on the panel -> a quick ephemeral list of common questions.
+async function handleSupportFaq(interaction) {
+  const faqEmbed = new EmbedBuilder()
+    .setColor(SUPPORT_COLOR)
+    .setTitle("❓ Frequently Asked Questions")
+    .addFields(
+      {
+        name: "🕐 How fast will I get a reply?",
+        value: "Most tickets are answered within a few hours. You'll be pinged inside your ticket when a moderator responds.",
+      },
+      {
+        name: "🔒 Is my ticket private?",
+        value: "Yes. Your ticket is a private thread that only you and the support team can see.",
+      },
+      {
+        name: "📎 Can I attach files?",
+        value: "Absolutely — screenshots, logs, and other files help us solve your issue faster.",
+      },
+      {
+        name: "🔐 How do I close my ticket?",
+        value: "Press the **Close Ticket** button at the top of your ticket when you're done.",
+      }
+    )
+    .setFooter({ text: "Still stuck? Press Support to open a ticket." });
+  await interaction.reply({ embeds: [faqEmbed], ephemeral: true });
+}
+
+// True when a message is one of our support panels.
+function isSupportPanelMessage(message) {
+  return (
+    message &&
+    message.components.some((row) =>
+      row.components.some((button) => button.customId === "support_open")
+    )
+  );
+}
+
+// Look for the panel in a channel: first the recorded message id, then a scan
+// of the recent history (covers a lost supportData.json record).
+async function findPanelInChannel(channel) {
+  const stored = supportState.panel;
+  const cached =
+    stored && stored.channelId === channel.id
+      ? await channel.messages.fetch(stored.messageId).catch(() => null)
+      : null;
+  if (isSupportPanelMessage(cached)) return cached;
+  const recent = await channel.messages.fetch({ limit: 100 }).catch(() => null);
+  const found =
+    recent && recent.find((message) => isSupportPanelMessage(message));
+  return found || null;
+}
+
+// Post the support panel in a channel (used by "/set module: Support Panel").
+// Never duplicates: reuses the panel already in that channel, and when the
+// panel is moved to a different channel the old one is deleted first.
+async function ensureSupportPanel(channel) {
+  const guild = channel.guild;
+
+  // 1. Already in this channel? (recorded message id, then recent history)
+  const existing = await findPanelInChannel(channel);
+  if (existing) {
+    supportState.panel = { guildId: guild.id, channelId: channel.id, messageId: existing.id };
+    saveSupportState();
+    console.log(`🛟 Support panel already present in #${channel.name} (message ${existing.id}).`);
+    return `✅ The **Support Panel** is already posted in ${channel} — I reused it.`;
+  }
+
+  // 2. The panel currently lives in another channel? Remove the old one so
+  //    there is always exactly one live panel.
+  const oldRecord = supportState.panel;
+  if (oldRecord && oldRecord.channelId && oldRecord.channelId !== channel.id) {
+    const oldChannel = await guild.channels.fetch(oldRecord.channelId).catch(() => null);
+    const oldMessage = oldChannel
+      ? await oldChannel.messages.fetch(oldRecord.messageId).catch(() => null)
+      : null;
+    if (isSupportPanelMessage(oldMessage)) {
+      await oldMessage.delete("Support panel moved to another channel");
+      console.log(`🗑️ Removed old support panel from #${oldChannel.name}.`);
+    }
+  }
+
+  // 3. Post a fresh panel in this channel.
+  const sent = await channel.send(supportPanelPayload());
+  supportState.panel = { guildId: guild.id, channelId: channel.id, messageId: sent.id };
+  saveSupportState();
+  console.log(`🛟 Support panel posted in #${channel.name} (message ${sent.id}).`);
+  return `✅ **Support Panel** posted in ${channel}! Users can now press **Support** to open a private support ticket.`;
+}
+
+// On startup: drop ticket records whose threads no longer exist (deleted while
+// the bot was offline). Does NOT post the panel — that only happens via /set.
+async function pruneStaleTickets() {
+  for (const [guildId, byUser] of Object.entries(supportState.tickets)) {
+    for (const [userId, record] of Object.entries(byUser)) {
+      const thread = await client.channels.fetch(record.threadId).catch(() => null);
+      if (!thread) {
+        delete supportState.tickets[guildId][userId];
+        console.log(`🧹 Removed stale support ticket record for ${userId} (${record.threadId})`);
+      }
+    }
+    if (Object.keys(supportState.tickets[guildId]).length === 0) {
+      delete supportState.tickets[guildId];
+    }
+  }
+  saveSupportState();
+}
+
+// Guards against two rapid clicks ever creating two threads for one user, and
+// two concurrent /set calls ever posting two panels in the same channel.
+const ticketCreationLocks = new Map();
+const panelSetupLocks = new Map();
+
+// Support-role cache (per guild, refreshed every 5 minutes) so every button
+// press does not hit the Discord API, and the role's position stays stable.
+const anchorRoleCache = new Map(); // guildId -> { role, fetchedAt }
+const ANCHOR_ROLE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+async function getAnchorRole(guild) {
+  const cached = anchorRoleCache.get(guild.id);
+  if (cached && Date.now() - cached.fetchedAt < ANCHOR_ROLE_CACHE_TTL_MS) return cached.role;
+  const role = await guild.roles.fetch(SUPPORT_ROLE_ID);
+  anchorRoleCache.set(guild.id, { role, fetchedAt: Date.now() });
+  return role;
+}
+
+// May this member press the "Support" button? They qualify when they hold
+// SUPPORT_ROLE_ID, or when any role they hold sits above it in the role
+// hierarchy. If the support role doesn't exist in the guild, nobody can
+// qualify. Every decision is logged so a denied press can be diagnosed.
+async function canOpenSupportTicket(member) {
+  try {
+    const anchorRole = await getAnchorRole(member.guild);
+    if (member.roles.cache.has(SUPPORT_ROLE_ID)) {
+      console.log(`🎟️ ${member.user.tag} (${member.id}) allowed: holds the support role.`);
+      return true;
+    }
+    const allowed = member.roles.cache.some((role) => role.position > anchorRole.position);
+    console.log(
+      `🎟️ ${member.user.tag} (${member.id}) ${allowed ? "allowed" : "DENIED"}: ` +
+        `highest role "${member.roles.highest.name}" pos ${member.roles.highest.position} vs ` +
+        `support role "${anchorRole.name}" pos ${anchorRole.position}.`
+    );
+    return allowed;
+  } catch (error) {
+    console.error(
+      `🎟️ ${member.user.tag} (${member.id}) DENIED in guild "${member.guild.name}" (${member.guild.id}): ` +
+        `could not fetch support role ${SUPPORT_ROLE_ID} — ${error.message}`
+    );
+    return false;
+  }
+}
+
+// "Support" button on the panel -> check permission, then ask which topic the
+// ticket is about (the actual ticket opens once the topic is picked).
+async function handleSupportOpen(interaction) {
+  const user = interaction.user;
+  // interaction.member is normally included on guild button presses; fall back
+  // to a REST fetch just in case it is ever missing.
+  const member =
+    interaction.member || (await interaction.guild.members.fetch(user.id).catch(() => null));
+  if (!member || !(await canOpenSupportTicket(member))) {
+    console.log(`🎟️ DENIED press by ${user.tag} (${user.id}) in guild ${interaction.guild?.id}.`);
+    await interaction.reply({
+      content: "❌ You are not allowed to open a support ticket.",
+      ephemeral: true,
+    });
+    return;
+  }
+  const channel = interaction.channel;
+  if (!channel || !channel.guild || typeof channel.threads?.create !== "function") {
+    await interaction.reply({
+      content: "❌ Support tickets can't be opened in this channel.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  // Ask which topic the ticket is about before opening anything. If a ticket
+  // is already open, the user finds out right after picking a topic.
+  const topicRow = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId("support_category")
+      .setPlaceholder("Choose a topic for your ticket")
+      .addOptions(
+        SUPPORT_CATEGORIES.map((c) => ({
+          label: `${c.emoji} ${c.label}`,
+          value: c.value,
+          description: c.description,
+        }))
+      )
+  );
+  await interaction.reply({
+    content:
+      "🛟 **What can we help you with?** Choose a topic below to open your private support ticket.",
+    components: [topicRow],
+    ephemeral: true,
+  });
+}
+
+// Topic picked in the dropdown -> open the ticket for that category.
+async function handleSupportCategory(interaction) {
+  const category = categoryByValue(interaction.values?.[0]) || SUPPORT_CATEGORIES[0];
+  await openSupportTicket(interaction, category);
+}
+
+async function openSupportTicket(interaction, category) {
+  const user = interaction.user;
+  await interaction.deferReply({ ephemeral: true });
+
+  const lockKey = `${interaction.guildId}:${user.id}`;
+  if (ticketCreationLocks.has(lockKey)) {
+    await interaction.editReply({
+      content: "⏳ Your ticket is already being opened — one moment.",
+    });
+    return;
+  }
+  ticketCreationLocks.set(lockKey, true);
+  try {
+    // Never create a second ticket while one is already open.
+    const existing = await findOpenTicket(interaction.guildId, user.id);
+    if (existing) {
+      await interaction.editReply({
+        content: `✅ You already have an open ticket: <#${existing.id}> — a moderator will help you there.`,
+      });
+      return;
+    }
+
+    // Private thread: nobody can see it until they are explicitly added. Use
+    // the longest auto-archive window the guild's boost tier allows, so a
+    // ticket that is quiet for a while does not vanish on its owner.
+    const premiumTier = interaction.guild?.premiumTier ?? 0;
+    const autoArchiveDuration =
+      premiumTier >= 2 ? 10080 : premiumTier >= 1 ? 4320 : 1440; // min 1w / 3d / 24h
+    const thread = await interaction.channel.threads.create({
+      name: supportThreadName(user, category),
+      type: ChannelType.PrivateThread,
+      invitable: false, // only members explicitly added below (or Manage Threads) can join
+      autoArchiveDuration,
+      reason: `Support ticket opened by ${user.tag} (${category.label})`,
+    });
+
+    // Remember the ticket before anything else, so even a partial failure below
+    // never lets the same user end up with two tickets.
+    const ticketId = generateTicketId();
+    if (!supportState.tickets[interaction.guildId]) supportState.tickets[interaction.guildId] = {};
+    supportState.tickets[interaction.guildId][user.id] = {
+      threadId: thread.id,
+      username: user.username,
+      openedAt: Date.now(),
+      category: category.value,
+      ticketId,
+    };
+    saveSupportState();
+
+    const ticketEmbed = new EmbedBuilder()
+      .setColor(category.color)
+      .setAuthor({ name: user.username, iconURL: user.displayAvatarURL({ size: 64 }) })
+      .setTitle(`📞 ${category.emoji} ${category.label}`)
+      .setDescription(
+        "Thank you for contacting support! Please describe your issue in as much detail as possible below.\n\n" +
+          `🆔 **Ticket:** \`${ticketId}\`\n` +
+          `🗂 **Category:** ${category.emoji} ${category.label}\n` +
+          `📌 **Status:** Please wait for a moderator to respond.\n` +
+          `🕐 **Opened:** <t:${Math.floor(Date.now() / 1000)}:R>`
+      )
+      .setFooter({ text: "Close the ticket with the button below when you're done." });
+    const closeRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`support_close:${user.id}`)
+        .setLabel("Close Ticket")
+        .setEmoji("🔒")
+        .setStyle(ButtonStyle.Danger)
+    );
+
+    // The top (first) message of the thread: a panel that says to wait for a
+    // moderator and pings the moderator + the ticket owner.
+    await thread.send({
+      content: `**Please wait for a moderator to respond** to your ticket.\n<@&${SUPPORT_NOTIFY_MOD_ID}> <@${user.id}>`,
+      embeds: [ticketEmbed],
+      components: [closeRow],
+    });
+
+    console.log(
+      `📞 Support ticket created: "${thread.name}" (${thread.id}) by ${user.tag} [${category.label}]`
+    );
+
+    // Clean confirmation: an embed instead of plain text.
+    const confirmEmbed = new EmbedBuilder()
+      .setColor(category.color)
+      .setTitle("✅ Ticket Opened")
+      .setDescription(`Your **${category.label}** ticket is ready: <#${thread.id}>`)
+      .addFields(
+        { name: "🆔 Ticket", value: `\`${ticketId}\``, inline: true },
+        { name: "🗂 Category", value: `${category.emoji} ${category.label}`, inline: true },
+        { name: "🕐 Opened", value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true }
+      )
+      .setFooter({ text: "Please wait for a moderator to respond in your ticket." });
+
+    await interaction.editReply({ embeds: [confirmEmbed] });
+  } catch (error) {
+    console.error("❌ Failed to open support ticket:", error.message);
+    await interaction
+      .editReply({
+        content:
+          `❌ Failed to open a support ticket: ${error.message}\n` +
+          "Make sure the bot has the **Create Private Threads** and **Manage Threads** " +
+          "permissions in the support channel, then try again.",
+      })
+      .catch(() => {});
+  } finally {
+    ticketCreationLocks.delete(lockKey);
+  }
+}
+
+async function handleSupportClose(interaction) {
+  const thread = interaction.channel;
+  const creatorId = (interaction.customId || "").split(":")[1];
+  const isOwner = creatorId === interaction.user.id;
+  const isStaff = memberMatchesAny(interaction.member, SUPPORT_STAFF_IDS);
+  const canManageThreads =
+    interaction.memberPermissions?.has(PermissionFlagsBits.ManageThreads) ||
+    interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
+
+  if (!thread || !thread.guild || thread.type !== ChannelType.PrivateThread) {
+    await interaction.reply({
+      content: "❌ This button can only be used inside a support ticket.",
+      ephemeral: true,
+    });
+    return;
+  }
+  if (!isOwner && !isStaff && !canManageThreads) {
+    await interaction.reply({
+      content: "❌ You don't have permission to close this ticket.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+  try {
+    // Snapshot the record, then forget the ticket first, so a new one can be
+    // opened right away.
+    const record = creatorId ? supportState.tickets[thread.guildId]?.[creatorId] : null;
+    if (creatorId && supportState.tickets[thread.guildId]?.[creatorId]) {
+      delete supportState.tickets[thread.guildId][creatorId];
+      if (Object.keys(supportState.tickets[thread.guildId]).length === 0) {
+        delete supportState.tickets[thread.guildId];
+      }
+      saveSupportState();
+    }
+
+    await interaction.editReply({ content: "🔒 Closing this ticket…" });
+
+    const category = record ? categoryByValue(record.category) : null;
+    const closedEmbed = new EmbedBuilder()
+      .setColor(0x6b7280)
+      .setTitle("🔒 Ticket Closed")
+      .setDescription(
+        `Your support ticket **${thread.name}** has been closed. Thanks for reaching out!`
+      )
+      .addFields(
+        { name: "🆔 Ticket", value: `\`${record?.ticketId || "—"}\``, inline: true },
+        {
+          name: "🗂 Category",
+          value: category ? `${category.emoji} ${category.label}` : "—",
+          inline: true,
+        },
+        {
+          name: "⏱ Duration",
+          value: record ? formatDuration(Date.now() - record.openedAt) : "—",
+          inline: true,
+        }
+      )
+      .setFooter({ text: "Feel free to open a new ticket anytime if you need more help." });
+
+    try {
+      await thread.delete(`Support ticket closed by ${interaction.user.tag}`);
+      console.log(`🗑️ Support ticket ${thread.id} closed by ${interaction.user.tag}`);
+      await interaction.editReply({ embeds: [closedEmbed] });
+    } catch (deleteError) {
+      // No permission to delete -> archive & lock as a fallback so the
+      // conversation is still closed and can't be written in anymore.
+      console.error(
+        `⚠️ Could not delete ticket ${thread.id}: ${deleteError.message} — archiving instead.`
+      );
+      try {
+        await thread.setLocked(true);
+        await thread.setArchived(true);
+      } catch (_) {
+        /* ignore secondary failures */
+      }
+      await interaction
+        .editReply({
+          content:
+            "⚠️ The ticket could not be deleted, so it was archived instead. " +
+            "A moderator can delete it manually.",
+        })
+        .catch(() => {});
+    }
+  } catch (error) {
+    console.error("❌ Failed to close support ticket:", error.message);
+    await interaction
+      .editReply({ content: "❌ Failed to close the ticket. Please try again." })
+      .catch(() => {});
+  }
+}
+
 // Bot ready event
 client.once(Events.ClientReady, async () => {
   console.log(`🤖 Bot logged in as ${client.user.tag}`);
@@ -1686,6 +2250,12 @@ client.once(Events.ClientReady, async () => {
     sampleLatencyOnce().then(updatePresence);
   }, LATENCY_SAMPLE_INTERVAL_MS);
   await registerCommands();
+  // Clean up ticket records whose threads were deleted while the bot was
+  // offline. The support panel itself is only posted via `/set module:
+  // Support Panel` — never automatically.
+  await pruneStaleTickets().catch((error) =>
+    console.error("❌ Support ticket cleanup failed:", error.message)
+  );
 });
 
 // Handle slash command interactions
@@ -1703,6 +2273,29 @@ client.on("interactionCreate", async (interaction) => {
     } catch (error) {
       console.error("❌ Error refreshing /status:", error);
     }
+    return;
+  }
+
+  // Support ticket buttons: "Support" + "FAQ" on the panel and "Close Ticket"
+  // inside a ticket (private thread).
+  if (interaction.isButton()) {
+    if (interaction.customId === "support_open") {
+      await handleSupportOpen(interaction);
+      return;
+    }
+    if (interaction.customId === "support_faq") {
+      await handleSupportFaq(interaction);
+      return;
+    }
+    if (interaction.customId.startsWith("support_close:")) {
+      await handleSupportClose(interaction);
+      return;
+    }
+  }
+
+  // Ticket topic dropdown picked on the panel -> open the ticket for that topic.
+  if (interaction.isStringSelectMenu() && interaction.customId === "support_category") {
+    await handleSupportCategory(interaction);
     return;
   }
 
@@ -1730,6 +2323,48 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.reply({
           content: "🛑 **Nexora AI** has been turned off in this server. I'll stop replying here.",
         });
+        return;
+      }
+
+      // Post the support panel in this channel (only allowed managers).
+      if (module === "support_panel") {
+        if (!memberMatchesAny(interaction.member, SUPPORT_PANEL_MANAGER_IDS)) {
+          await interaction.reply({
+            content: "❌ You are not allowed to set up the support panel.",
+            ephemeral: true,
+          });
+          return;
+        }
+        const channel = interaction.channel;
+        if (!channel || !channel.guild || channel.type !== ChannelType.GuildText) {
+          await interaction.reply({
+            content: "❌ The support panel can only be posted in a text channel.",
+            ephemeral: true,
+          });
+          return;
+        }
+        await interaction.deferReply();
+        const panelLockKey = `${interaction.guildId}:${channel.id}`;
+        if (panelSetupLocks.has(panelLockKey)) {
+          await interaction.editReply({
+            content: "⏳ The support panel is already being set up — one moment.",
+          });
+          return;
+        }
+        panelSetupLocks.set(panelLockKey, true);
+        try {
+          const message = await ensureSupportPanel(channel);
+          await interaction.editReply({ content: message });
+        } catch (error) {
+          console.error("❌ Failed to post the support panel:", error.message);
+          await interaction.editReply({
+            content:
+              "❌ Failed to post the support panel. Check my permissions in this channel " +
+              "(Send Messages) and try again.",
+          });
+        } finally {
+          panelSetupLocks.delete(panelLockKey);
+        }
         return;
       }
 
@@ -1833,7 +2468,7 @@ const HELP_TEXT =
   "📋 **Available Commands:**\n" +
   "`/removebg` - Remove background from an image\n" +
   "`/status` - Check bot status (latency, CPU, RAM, uptime)\n" +
-  "`/set` - Turn this channel into a Nexora AI chat channel\n" +
+  "`/set` - Turn this channel into a Nexora AI chat channel or post the Support Panel\n" +
   "`/newtask` - Forget the current Nexora AI chat and start fresh\n" +
   "`/analyze` - Analyze any file (image, mp4, mp3, PDF, Word, PPTX, Excel, code...)\n" +
   "`/imagine` - Generate an image from a description; attach a reference image to edit it\n" +
