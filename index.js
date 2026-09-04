@@ -16,6 +16,8 @@ const {
 } = require("discord.js");
 const axios = require("axios");
 const os = require("os");
+const fs = require("fs");
+const path = require("path");
 const sharp = require("sharp");
 const { removeBackground } = require("@imgly/background-removal-node");
 
@@ -25,6 +27,108 @@ const PROCESS_TIMEOUT_MS = 120000; // 2 minutes
 // Images above this many pixels on the longest side skip the aspect-correction
 // padding step, so very large images don't blow up memory on the square canvas.
 const MAX_PAD_CANVAS = 4096;
+
+// ---- Nexora AI (chat module) ---------------------------------------------
+// When a channel is registered with /set, every non-command message sent there
+// is answered by Google Gemini. The active channel per server is persisted to
+// aiChannels.json so it survives bot restarts.
+const DEFAULT_GEMINI_MODEL = "gemini-3.6-flash";
+const DEFAULT_FALLBACK_MODELS = ["gemini-3.6-flash-lite", "gemini-3.6-pro"];
+// Multi-model fallback chain: Nexora AI tries each model in order until one
+// answers, so a retired, blocked, or rate-limited model never takes the chat
+// down. The primary is always gemini-3.6-flash unless overridden.
+//   GEMINI_MODEL  -> primary model (single, optional)
+//   GEMINI_MODELS -> full chain as a comma-separated list (optional)
+const GEMINI_MODELS = (() => {
+  const primary = (process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL).trim();
+  const configured = (process.env.GEMINI_MODELS || "")
+    .split(",")
+    .map((m) => m.trim())
+    .filter(Boolean);
+  const chain = configured.length > 0 ? configured : [primary, ...DEFAULT_FALLBACK_MODELS];
+  if (primary && !chain.includes(primary)) chain.unshift(primary);
+  return chain;
+})();
+const NEXORA_SYSTEM_PROMPT =
+  "You are Nexora AI, a friendly and helpful AI assistant in a Discord server. " +
+  "Keep replies concise and natural, and answer in the same language the user writes in.";
+
+const AI_CHANNELS_FILE = path.join(__dirname, "aiChannels.json");
+
+function loadAiChannels() {
+  try {
+    return new Map(Object.entries(JSON.parse(fs.readFileSync(AI_CHANNELS_FILE, "utf8"))));
+  } catch {
+    return new Map(); // no file yet or unreadable -> start empty
+  }
+}
+
+function saveAiChannels() {
+  try {
+    fs.writeFileSync(AI_CHANNELS_FILE, JSON.stringify(Object.fromEntries(aiChannels), null, 2));
+  } catch (error) {
+    console.error("⚠️ Failed to save Nexora AI channels:", error.message);
+  }
+}
+
+const aiChannels = loadAiChannels();
+
+// Per-guild chat memory for Nexora AI. Kept in RAM, capped per guild (see
+// MAX_HISTORY_MESSAGES), and wiped by /newtask so long chats stay light.
+const conversationMemory = new Map();
+
+// Ask Google Gemini to generate a reply for the given user text, using the
+// remembered conversation history (per guild) for context. Models are tried in
+// order until one answers, so the chat keeps working if one model is retired,
+// blocked, or rate-limited.
+async function askGemini(guildId, text) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error("GEMINI_API_KEY is missing in .env");
+  }
+
+  // Build contents from the remembered history + the new message. History
+  // always alternates user/model because both sides are stored in pairs.
+  const history = conversationMemory.get(guildId) || [];
+  const contents = history.map((entry) => ({
+    role: entry.role,
+    parts: [{ text: entry.text }],
+  }));
+  contents.push({ role: "user", parts: [{ text }] });
+
+  const failures = [];
+  for (const model of GEMINI_MODELS) {
+    try {
+      const response = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+        {
+          systemInstruction: { parts: [{ text: NEXORA_SYSTEM_PROMPT }] },
+          contents,
+          generationConfig: { maxOutputTokens: MAX_OUTPUT_TOKENS, temperature: 0.7 },
+        },
+        { timeout: 60000 }
+      );
+      const reply = response.data?.candidates?.[0]?.content?.parts
+        ?.map((part) => part.text ?? "")
+        .join("")
+        .trim();
+      if (!reply) {
+        throw new Error("Gemini returned an empty response");
+      }
+      return { reply, model };
+    } catch (error) {
+      // axios hides the real reason behind "Request failed with status code 403".
+      // Surface Google's actual message (invalid key, suspended project, quota,
+      // retired model, ...) so logs point at the true cause.
+      const status = error.response?.status;
+      const detail = error.response?.data?.error?.message || error.message;
+      failures.push(`${model}: ${status ? `HTTP ${status}` : "network"} — ${detail}`);
+      console.warn(`⚠️ Model "${model}" failed${status ? ` (HTTP ${status})` : ""}: ${detail}`);
+    }
+  }
+
+  throw new Error(`All Gemini models failed. ${failures.join(" | ")}`);
+}
 
 // ---- Queue configuration -------------------------------------------------
 // At most MAX_CONCURRENT_TASKS images are processed at the same time.
@@ -38,6 +142,9 @@ const envInt = (name, fallback, min = 0) => {
 const MAX_CONCURRENT_TASKS = envInt("MAX_CONCURRENT_TASKS", 20, 1);
 const MAX_WAITING_JOBS = envInt("MAX_WAITING_JOBS", 60, 1);
 const QUEUE_UPDATE_INTERVAL_MS = envInt("QUEUE_UPDATE_INTERVAL_MS", 4000, 0);
+// Nexora AI chat settings: reply length cap and per-guild memory size (RAM).
+const MAX_OUTPUT_TOKENS = envInt("MAX_OUTPUT_TOKENS", 1024, 64);
+const MAX_HISTORY_MESSAGES = envInt("MAX_HISTORY_MESSAGES", 20, 1);
 // How often the background probe re-measures latency. The bot presence and
 // /status read these samples, so the value shown is never more than a few
 // seconds old (the gateway heartbeat alone would be up to ~40s stale).
@@ -77,6 +184,22 @@ const commands = [
   new SlashCommandBuilder()
     .setName("status")
     .setDescription("Check bot status: latency, CPU, RAM, uptime, and more"),
+  new SlashCommandBuilder()
+    .setName("set")
+    .setDescription("Turn this channel into an AI chat channel")
+    .addStringOption((option) =>
+      option
+        .setName("module")
+        .setDescription("The module to enable in this channel")
+        .setRequired(true)
+        .addChoices(
+          { name: "Nexora AI", value: "nexora_ai" },
+          { name: "Off", value: "off" }
+        )
+    ),
+  new SlashCommandBuilder()
+    .setName("newtask")
+    .setDescription("Start a fresh Nexora AI conversation (forgets chat history)"),
 ].map((command) => command.toJSON());
 
 // Register slash commands
@@ -643,6 +766,7 @@ async function enqueueRequest(interaction, attachment) {
 // Bot ready event
 client.once(Events.ClientReady, async () => {
   console.log(`🤖 Bot logged in as ${client.user.tag}`);
+  console.log(`🧠 Nexora AI model chain: ${GEMINI_MODELS.join(" → ")}`);
   console.log(`📊 Queue config: max ${MAX_CONCURRENT_TASKS} concurrent tasks, max ${MAX_WAITING_JOBS} waiting`);
   console.log(`📡 Latency probe: every ${LATENCY_SAMPLE_INTERVAL_MS / 1000}s, rolling ${LATENCY_HISTORY_MAX} samples`);
   updatePresence();
@@ -682,6 +806,58 @@ client.on("interactionCreate", async (interaction) => {
     } catch (error) {
       console.error("❌ Error handling /status:", error);
     }
+    return;
+  }
+
+  if (interaction.commandName === "set") {
+    try {
+      const module = interaction.options.getString("module");
+
+      if (module === "off") {
+        aiChannels.delete(interaction.guildId);
+        saveAiChannels();
+        await interaction.reply({
+          content: "🛑 **Nexora AI** has been turned off in this server. I'll stop replying here.",
+        });
+        return;
+      }
+
+      if (!process.env.GEMINI_API_KEY) {
+        await interaction.reply({
+          content:
+            "❌ **GEMINI_API_KEY** is not set in `.env`. Add your Google Gemini API key, " +
+            "restart the bot, then run `/set` again.",
+          ephemeral: true,
+        });
+        return;
+      }
+
+      aiChannels.set(interaction.guildId, interaction.channelId);
+      saveAiChannels();
+      await interaction.reply({
+        content:
+          `✅ **Nexora AI** is now active in ${interaction.channel}! ` +
+          "I'll reply to every message sent here. Use `/set module: Off` to disable it.",
+      });
+    } catch (error) {
+      console.error("❌ Error handling /set:", error);
+      await interaction
+        .reply({
+          content: "❌ Something went wrong while setting the module. Please try again.",
+          ephemeral: true,
+        })
+        .catch(() => {});
+    }
+    return;
+  }
+
+  if (interaction.commandName === "newtask") {
+    const cleared = conversationMemory.delete(interaction.guildId);
+    await interaction.reply({
+      content: cleared
+        ? "🧹 **Nexora AI** memory cleared — starting a fresh conversation!"
+        : "🧹 Nexora AI memory is already empty — nothing to forget.",
+    });
     return;
   }
 
@@ -737,8 +913,54 @@ client.on("messageCreate", async (message) => {
       "📋 **Available Commands:**\n" +
         "`/removebg` - Remove background from an image\n" +
         "`/status` - Check bot status (latency, CPU, RAM, uptime)\n" +
-        "Just use the slash command and attach an image!"
+      "`/set` - Turn this channel into a Nexora AI chat channel\n" +
+      "`/newtask` - Forget the current Nexora AI chat and start fresh\n" +
+      "Just use the slash command and attach an image!"
     );
+  }
+
+  // Nexora AI: reply to every message in a registered chat channel
+  const aiChannelId = aiChannels.get(message.guildId);
+  if (aiChannelId && message.channelId === aiChannelId) {
+    const text = message.content.trim();
+    if (!text) return;
+    try {
+      await message.channel.sendTyping();
+      const { reply, model } = await askGemini(message.guildId, text);
+      // Remember both sides so the next message has full context.
+      const history = conversationMemory.get(message.guildId) || [];
+      history.push({ role: "user", text }, { role: "model", text: reply });
+      while (history.length > MAX_HISTORY_MESSAGES) history.shift();
+      conversationMemory.set(message.guildId, history);
+      if (model !== GEMINI_MODELS[0]) {
+        console.log(`🤖 Nexora AI answered with fallback model: ${model}`);
+      }
+      await message.reply(reply);
+    } catch (error) {
+      console.error("❌ Nexora AI error:", error.message);
+      const message_ = error.message;
+      let hint;
+      if (message_.includes("GEMINI_API_KEY")) {
+        hint = "Set **GEMINI_API_KEY** in `.env`, restart the bot, then try again.";
+      } else if (message_.includes("suspended") || message_.includes("CONSUMER_SUSPENDED")) {
+        hint =
+          "Google has suspended the project behind the **GEMINI_API_KEY** (usually a billing issue). " +
+          "Check the Google Cloud console → Billing, or create a fresh key in AI Studio and update `.env`.";
+      } else if (message_.includes("HTTP 403") || message_.includes("HTTP 401")) {
+        hint = "Your Gemini API key was rejected — verify it is still valid in Google AI Studio.";
+      } else if (message_.includes("HTTP 404") || message_.includes("no longer available")) {
+        hint =
+          "The Gemini model is outdated. Set **GEMINI_MODEL** / **GEMINI_MODELS** in `.env` " +
+          "to a current model (e.g. `gemini-3.6-flash`), restart the bot, then try again.";
+      } else if (message_.includes("All Gemini models failed")) {
+        hint =
+          "All configured Gemini models failed — check the **GEMINI_MODELS** in `.env` and " +
+          "your API key/quota, then try again.";
+      } else {
+        hint = "Please try again in a moment.";
+      }
+      await message.reply(`⚠️ Nexora AI hit an error: ${hint}`).catch(() => {});
+    }
   }
 });
 
