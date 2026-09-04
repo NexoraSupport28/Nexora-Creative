@@ -49,8 +49,26 @@ const GEMINI_MODELS = (() => {
   if (primary && !chain.includes(primary)) chain.unshift(primary);
   return chain;
 })();
+// Image generation uses Gemini's native image models ("Nano Banana" family).
+// Each is tried in order until one produces an image:
+//   GEMINI_IMAGE_MODEL  -> primary image model (single, optional)
+//   GEMINI_IMAGE_MODELS -> full chain as a comma-separated list (optional)
+const DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-image";
+const DEFAULT_IMAGE_FALLBACK_MODELS = ["gemini-3-pro-image", "gemini-2.5-flash-image"];
+const IMAGE_MODELS = (() => {
+  const primary = (process.env.GEMINI_IMAGE_MODEL || DEFAULT_IMAGE_MODEL).trim();
+  const configured = (process.env.GEMINI_IMAGE_MODELS || "")
+    .split(",")
+    .map((m) => m.trim())
+    .filter(Boolean);
+  const chain = configured.length > 0 ? configured : [primary, ...DEFAULT_IMAGE_FALLBACK_MODELS];
+  if (primary && !chain.includes(primary)) chain.unshift(primary);
+  return chain;
+})();
 const NEXORA_SYSTEM_PROMPT =
   "You are Nexora AI, a friendly and helpful AI assistant in a Discord server. " +
+  "You can see and analyze the files users attach to the conversation " +
+  "(images, audio, video, PDFs, Word/Excel/PowerPoint, and source code). " +
   "Keep replies concise and natural, and answer in the same language the user writes in.";
 
 const AI_CHANNELS_FILE = path.join(__dirname, "aiChannels.json");
@@ -78,23 +96,42 @@ const aiChannels = loadAiChannels();
 const conversationMemory = new Map();
 
 // Ask Google Gemini to generate a reply for the given user text, using the
-// remembered conversation history (per guild) for context. Models are tried in
+// remembered conversation history (per guild) for context. Attachments are
+// analyzed in the same request (see buildUserTurnParts). Models are tried in
 // order until one answers, so the chat keeps working if one model is retired,
 // blocked, or rate-limited.
-async function askGemini(guildId, text) {
+async function askGemini(guildId, text, options = {}) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error("GEMINI_API_KEY is missing in .env");
   }
 
+  const {
+    attachments = [],
+    includeHistory = true,
+    maxOutputTokens = MAX_OUTPUT_TOKENS,
+    timeoutMs = 60000,
+  } = options;
+
   // Build contents from the remembered history + the new message. History
-  // always alternates user/model because both sides are stored in pairs.
-  const history = conversationMemory.get(guildId) || [];
-  const contents = history.map((entry) => ({
-    role: entry.role,
-    parts: [{ text: entry.text }],
-  }));
-  contents.push({ role: "user", parts: [{ text }] });
+  // always alternates user/model because both sides are stored in pairs and
+  // only ever contains text (files travel with a single message and are not
+  // remembered across turns, which keeps memory light).
+  const contents = [];
+  if (includeHistory) {
+    const history = conversationMemory.get(guildId) || [];
+    for (const entry of history) {
+      contents.push({ role: entry.role, parts: [{ text: entry.text }] });
+    }
+  }
+  // The user's current turn: instruction text plus Gemini parts for every
+  // attached file (images/audio/video/documents inline, text/code as text).
+  const userParts = await buildUserTurnParts(text, attachments);
+  contents.push({ role: "user", parts: userParts });
+
+  // Analyzing audio/video/documents takes longer than plain text.
+  const effectiveTimeout =
+    attachments.length > 0 ? Math.max(timeoutMs, 180000) : timeoutMs;
 
   const failures = [];
   for (const model of GEMINI_MODELS) {
@@ -104,9 +141,9 @@ async function askGemini(guildId, text) {
         {
           systemInstruction: { parts: [{ text: NEXORA_SYSTEM_PROMPT }] },
           contents,
-          generationConfig: { maxOutputTokens: MAX_OUTPUT_TOKENS, temperature: 0.7 },
+          generationConfig: { maxOutputTokens, temperature: 0.7 },
         },
-        { timeout: 60000 }
+        { timeout: effectiveTimeout }
       );
       const reply = response.data?.candidates?.[0]?.content?.parts
         ?.map((part) => part.text ?? "")
@@ -128,6 +165,476 @@ async function askGemini(guildId, text) {
   }
 
   throw new Error(`All Gemini models failed. ${failures.join(" | ")}`);
+}
+
+// ---- Multimodal file analysis ---------------------------------------------
+// Nexora AI understands attachments by sending them to Gemini in the same
+// request as the user's text:
+//   • images / audio / video / PDF / Word / Excel / PowerPoint  -> inline data
+//   • plain text & source code                                  -> sent as text
+// Gemini accepts far more inline data than Discord allows users to upload, so
+// attachment.size is the real bottleneck (Discord caps ~25MB per file).
+const MAX_ANALYSIS_FILE_SIZE = 24 * 1024 * 1024; // per file
+const MAX_ANALYSIS_TOTAL_BYTES = 60 * 1024 * 1024; // combined per request
+// Source files longer than this are truncated (token limits); a note tells the
+// model the file was cut off.
+const MAX_TEXT_ATTACHMENT_CHARS = 200000;
+
+// Extension -> MIME type used when Discord reports application/octet-stream or
+// no content type at all (common for code and some media files).
+const EXTENSION_MIME = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  webp: "image/webp",
+  gif: "image/gif",
+  heic: "image/heic",
+  heif: "image/heif",
+  mp3: "audio/mpeg",
+  wav: "audio/wav",
+  ogg: "audio/ogg",
+  oga: "audio/ogg",
+  opus: "audio/ogg",
+  flac: "audio/flac",
+  aac: "audio/aac",
+  m4a: "audio/mp4",
+  aiff: "audio/aiff",
+  aif: "audio/aiff",
+  mp4: "video/mp4",
+  m4v: "video/mp4",
+  mov: "video/quicktime",
+  webm: "video/webm",
+  mkv: "video/x-matroska",
+  avi: "video/x-msvideo",
+  mpg: "video/mpeg",
+  mpeg: "video/mpeg",
+  wmv: "video/x-ms-wmv",
+  flv: "video/x-flv",
+  "3gp": "video/3gpp",
+  "3gpp": "video/3gpp",
+  pdf: "application/pdf",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xls: "application/vnd.ms-excel",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ppt: "application/vnd.ms-powerpoint",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  rtf: "application/rtf",
+};
+// Every MIME in EXTENSION_MIME can be sent to Gemini as inline data.
+const SUPPORTED_MEDIA_MIMES = new Set(Object.values(EXTENSION_MIME));
+
+// Extensions treated as plain text / source code (read locally, then sent as a
+// text part so Gemini never needs to know each language's MIME type).
+const TEXT_FILE_EXTENSIONS = new Set([
+  "txt", "md", "markdown", "log", "csv", "tsv", "json", "js", "mjs", "cjs",
+  "jsx", "ts", "tsx", "py", "ipynb", "java", "c", "h", "cc", "cpp", "cxx",
+  "hpp", "cs", "go", "rs", "php", "rb", "sh", "bash", "zsh", "ksh", "ps1",
+  "bat", "cmd", "yaml", "yml", "xml", "html", "htm", "css", "scss", "sass",
+  "less", "sql", "ini", "cfg", "conf", "toml", "env", "gitignore", "vue",
+  "svelte", "kt", "kts", "swift", "scala", "lua", "pl", "pm", "r", "dart",
+  "ex", "exs", "erl", "hrl", "clj", "cljs", "edn", "hs", "elm", "ml", "fs",
+  "vb", "asm", "sol", "graphql", "gql", "proto", "tf", "tfvars", "hcl", "pug",
+  "ejs", "hbs", "twig", "lock", "properties", "jsp", "asp", "aspx", "m", "mm",
+  "gradle", "awk", "sed", "tex", "rtf",
+]);
+// Files whose *name* (no extension) marks them as text: Dockerfile, Makefile...
+const TEXT_FILE_NAMES = new Set([
+  "dockerfile", "makefile", "gemfile", "rakefile", "procfile", "license",
+  "readme", "contributing", "changelog", "cmakelists.txt",
+]);
+// MIME types that are really text/code even though they don't start with text/.
+const TEXT_MIME_TYPES = new Set([
+  "application/json", "application/xml", "application/javascript",
+  "application/x-javascript", "application/x-python", "application/x-sh",
+  "application/x-csh", "application/x-httpd-php", "application/ld+json",
+  "application/graphql",
+]);
+
+function analysisError(kind, message) {
+  const error = new Error(message);
+  error.isAnalysis = true;
+  error.kind = kind;
+  return error;
+}
+
+// Best-guess MIME for an attachment: trust Discord's content type unless it is
+// missing or a generic application/octet-stream, then fall back to the
+// extension mapping.
+function normalizeAttachmentMime(attachment, ext) {
+  const reported = (attachment.contentType || "").split(";")[0].trim().toLowerCase();
+  if (reported && reported !== "application/octet-stream") return reported;
+  return EXTENSION_MIME[ext] || "application/octet-stream";
+}
+
+// text -> read the bytes as UTF-8 and send them as a text part
+// media -> send as inlineData (image/audio/video/document)
+// unsupported -> the user gets a friendly error
+function classifyAttachmentFile(mime, ext, fileName) {
+  if (
+    TEXT_FILE_EXTENSIONS.has(ext) ||
+    TEXT_FILE_NAMES.has(fileName) ||
+    mime.startsWith("text/") ||
+    TEXT_MIME_TYPES.has(mime)
+  ) {
+    return "text";
+  }
+  if (SUPPORTED_MEDIA_MIMES.has(mime)) return "media";
+  return "unsupported";
+}
+
+// Turn a message's attachments into Gemini content parts. Throws an
+// analysisError with a user-friendly message when a file is too big or of an
+// unsupported type.
+async function prepareAttachmentParts(attachments) {
+  const parts = [];
+  let totalBytes = 0;
+  for (let i = 0; i < attachments.length; i++) {
+    const attachment = attachments[i];
+    const displayName = attachment.name || `file_${i + 1}`;
+    const fileName = displayName.toLowerCase();
+    const ext = path.extname(displayName).slice(1).toLowerCase();
+
+    if (attachment.size > MAX_ANALYSIS_FILE_SIZE) {
+      throw analysisError(
+        "too_large",
+        `❌ **${displayName}** is ${formatBytes(attachment.size)} — the per-file limit for analysis is ${formatBytes(MAX_ANALYSIS_FILE_SIZE)}. Please send a smaller file.`
+      );
+    }
+    totalBytes += attachment.size;
+    if (totalBytes > MAX_ANALYSIS_TOTAL_BYTES) {
+      throw analysisError(
+        "too_large",
+        `❌ These attachments total ${formatBytes(totalBytes)} — the combined limit is ${formatBytes(MAX_ANALYSIS_TOTAL_BYTES)} per message. Please send fewer or smaller files.`
+      );
+    }
+
+    const mime = normalizeAttachmentMime(attachment, ext);
+    const kind = classifyAttachmentFile(mime, ext, fileName);
+    if (kind === "unsupported") {
+      throw analysisError(
+        "unsupported",
+        `❌ **${displayName}** is a \`${mime}\` file, which I can't analyze. Supported: images (PNG/JPEG/WebP), audio (MP3/WAV/OGG/AAC/FLAC), video (MP4/MOV/WebM), PDF, Word, Excel, PowerPoint, and text/code files.`
+      );
+    }
+
+    const buffer = await downloadFile(attachment.url);
+    if (buffer.byteLength > MAX_ANALYSIS_FILE_SIZE) {
+      throw analysisError(
+        "too_large",
+        `❌ **${displayName}** is ${formatBytes(buffer.byteLength)} after download — the per-file limit for analysis is ${formatBytes(MAX_ANALYSIS_FILE_SIZE)}.`
+      );
+    }
+
+    if (kind === "text") {
+      let content = buffer.toString("utf8");
+      let truncated = false;
+      if (content.length > MAX_TEXT_ATTACHMENT_CHARS) {
+        content = content.slice(0, MAX_TEXT_ATTACHMENT_CHARS);
+        truncated = true;
+      }
+      parts.push({
+        text:
+          `\n[Attachment ${i + 1}/${attachments.length}: \`${displayName}\`]\n` +
+          "```\n" +
+          content +
+          "\n```" +
+          (truncated
+            ? `\n…(file was truncated after ${MAX_TEXT_ATTACHMENT_CHARS} characters)\n`
+            : ""),
+      });
+    } else {
+      // Label part first so Gemini knows which file each piece of media is.
+      parts.push({
+        text: `\n[Attachment ${i + 1}/${attachments.length}: \`${displayName}\` (${mime})]`,
+      });
+      parts.push({ inlineData: { mimeType: mime, data: buffer.toString("base64") } });
+    }
+  }
+  return parts;
+}
+
+// Prepare images attached as *references* for image generation/editing
+// (e.g. /imagine with a reference image). Only image MIME types are accepted;
+// each image is downloaded and turned into a Gemini inlineData part.
+async function prepareImageReferenceParts(attachments) {
+  const parts = [];
+  let totalBytes = 0;
+  for (let i = 0; i < attachments.length; i++) {
+    const attachment = attachments[i];
+    const displayName = attachment.name || `image_${i + 1}`;
+    const ext = path.extname(displayName).slice(1).toLowerCase();
+
+    if (attachment.size > MAX_ANALYSIS_FILE_SIZE) {
+      throw analysisError(
+        "too_large",
+        `❌ **${displayName}** is ${formatBytes(attachment.size)} — the per-file limit is ${formatBytes(MAX_ANALYSIS_FILE_SIZE)}. Please send a smaller image.`
+      );
+    }
+    totalBytes += attachment.size;
+    if (totalBytes > MAX_ANALYSIS_TOTAL_BYTES) {
+      throw analysisError(
+        "too_large",
+        `❌ These images total ${formatBytes(totalBytes)} — the combined limit is ${formatBytes(MAX_ANALYSIS_TOTAL_BYTES)} per request.`
+      );
+    }
+
+    const mime = normalizeAttachmentMime(attachment, ext);
+    if (!(mime.startsWith("image/") && SUPPORTED_MEDIA_MIMES.has(mime))) {
+      throw analysisError(
+        "unsupported",
+        `❌ **${displayName}** is a \`${mime}\` file — the reference must be an image (PNG, JPEG, WebP, HEIC, or GIF).`
+      );
+    }
+
+    const buffer = await downloadFile(attachment.url);
+    if (buffer.byteLength > MAX_ANALYSIS_FILE_SIZE) {
+      throw analysisError(
+        "too_large",
+        `❌ **${displayName}** is ${formatBytes(buffer.byteLength)} after download — the per-file limit is ${formatBytes(MAX_ANALYSIS_FILE_SIZE)}.`
+      );
+    }
+
+    parts.push({ text: `\n[Reference image ${i + 1}/${attachments.length}: \`${displayName}\`]` });
+    parts.push({ inlineData: { mimeType: mime, data: buffer.toString("base64") } });
+  }
+  return parts;
+}
+
+// Build the "user" turn for Gemini: instruction text first, then Gemini
+// content parts for every attached file.
+async function buildUserTurnParts(text, attachments) {
+  const parts = [];
+  const prompt = (text || "").trim();
+  if (!attachments || attachments.length === 0) {
+    return [{ text: prompt || "..." }];
+  }
+  if (prompt) parts.push({ text: prompt });
+  const fileParts = await prepareAttachmentParts(attachments);
+  for (const part of fileParts) parts.push(part);
+  if (!prompt) parts.unshift({ text: "Please analyze the attached file(s)." });
+  return parts;
+}
+
+// Split a long reply into Discord-sized chunks (Discord caps messages at 2000
+// characters), preferring to break on newlines / spaces.
+function splitLongText(text, maxLength = 1900) {
+  const message = String(text ?? "");
+  if (message.length <= maxLength) return [message];
+  const chunks = [];
+  let rest = message;
+  while (rest.length > maxLength) {
+    let cut = rest.lastIndexOf("\n", maxLength);
+    if (cut < maxLength / 2) cut = rest.lastIndexOf(" ", maxLength);
+    if (cut < maxLength / 2) cut = maxLength;
+    chunks.push(rest.slice(0, cut));
+    rest = rest.slice(cut).trimStart();
+  }
+  if (rest) chunks.push(rest);
+  return chunks;
+}
+
+// ---- Image generation -----------------------------------------------------
+// Native Gemini image models ("Nano Banana") return the picture as base64 in
+// candidates[].content.parts[].inlineData, requested with responseModalities.
+const IMAGE_GENERATION_TIMEOUT_MS = 180000;
+
+// referenceParts: optional inlineData parts for reference images. When present
+// the prompt is treated as an *editing* instruction (text-to-image-to-image)
+// instead of a from-scratch generation.
+async function generateImageFromPrompt(prompt, referenceParts = []) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    const error = new Error("GEMINI_API_KEY is missing in .env");
+    error.isImage = true;
+    throw error;
+  }
+
+  // Instruction first, then the reference images it refers to.
+  const parts = [{ text: prompt }, ...referenceParts];
+
+  const failures = [];
+  for (const model of IMAGE_MODELS) {
+    try {
+      const response = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+        {
+          contents: [{ role: "user", parts }],
+          generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
+        },
+        { timeout: IMAGE_GENERATION_TIMEOUT_MS }
+      );
+      // Safety filters return no candidate but report promptFeedback.
+      const blocked = response.data?.promptFeedback?.blockReason;
+      if (blocked) throw new Error(`Request blocked by safety filters (${blocked})`);
+      const parts = response.data?.candidates?.[0]?.content?.parts || [];
+      for (const part of parts) {
+        const mime = part.inlineData?.mimeType;
+        const data = part.inlineData?.data;
+        if (mime && data && mime.startsWith("image/")) {
+          return { buffer: Buffer.from(data, "base64"), mime, model };
+        }
+      }
+      throw new Error("Model returned no image");
+    } catch (error) {
+      const status = error.response?.status;
+      const detail = error.response?.data?.error?.message || error.message;
+      failures.push(`${model}: ${status ? `HTTP ${status}` : "network"} — ${detail}`);
+      console.warn(`🎨 Image model "${model}" failed${status ? ` (HTTP ${status})` : ""}: ${detail}`);
+    }
+  }
+
+  const error = new Error(`All image models failed. ${failures.join(" | ")}`);
+  error.isImage = true;
+  throw error;
+}
+
+// Wrap a generated image as a Discord attachment, recompressing to WebP when
+// the raw output would exceed Discord's 8MB upload limit.
+async function attachmentFromImageBuffer(buffer, mime, stem) {
+  let output = buffer;
+  let outputMime = mime && mime.startsWith("image/") ? mime : "image/png";
+  let ext = outputMime === "image/jpeg" ? "jpg" : outputMime === "image/webp" ? "webp" : "png";
+  if (output.byteLength > MAX_FILE_SIZE) {
+    console.log(`📦 Generated image is ${formatBytes(output.byteLength)} — compressing to fit Discord's limit...`);
+    output = await sharp(output).webp({ quality: 88 }).toBuffer();
+    outputMime = "image/webp";
+    ext = "webp";
+    if (output.byteLength > MAX_FILE_SIZE) {
+      throw new Error("Generated image is still too large for Discord even after compression");
+    }
+  }
+  return new AttachmentBuilder(output, { name: `${stem}.${ext}` });
+}
+
+// Phrases that make Nexora route a chat message to the image generator
+// instead of the text chat. /imagine is the explicit, always-reliable way.
+const IMAGE_REQUEST_PATTERNS = [
+  /^\/imagine\b/i,
+  /^imagine\b/i,
+  /^(?:buat(?:kan)?|bikin(?:in)?)\s+(?:aku|saya|kita|kami)?\s*(?:sebuah|suatu|satu)?\s*(?:gambar|foto|ilustrasi|logo|poster|kartun|meme)\b/i,
+  /^gambar(?:kan|in)?\s+(?:aku|saya|untuk)\b/i,
+  /^gambarkan\b/i,
+  /^(?:tolong|bisa|minta|please)\s+(?:buat(?:kan)?|bikin|gambarkan)\s+(?:gambar|foto|ilustrasi|logo|poster)\b/i,
+  /^(?:can you|could you|please)\s+(?:make|create|draw|generate)\b/i,
+  /^(?:create|draw|generate|make|produce)\s+(?:me\s+)?(?:an?\s+|a\s+)?(?:image|picture|photo|drawing|artwork?|illustration|logo|poster)\b/i,
+];
+
+function looksLikeImageRequest(text) {
+  const trimmed = (text || "").trim();
+  return IMAGE_REQUEST_PATTERNS.some((pattern) => pattern.test(trimmed));
+}
+
+// Edit-style instructions ("ubah foto ini jadi anime", "remove the background",
+// "ganti warna bajunya jadi merah", ...). Only treated as image edits when the
+// message actually has an attached image — see the chat handler.
+const IMAGE_EDIT_PATTERNS = [
+  /^(?:ubah|edit|ganti|gantikan|tambah(?:kan)?|hapus|hilangkan|jadikan?|buat jadi|bikinin?|tolong (?:ubah|edit|ganti|tambah(?:kan)?|hapus|hilangkan))/i,
+];
+
+function looksLikeImageEditRequest(text) {
+  const trimmed = (text || "").trim();
+  return IMAGE_EDIT_PATTERNS.some((pattern) => pattern.test(trimmed));
+}
+
+function imageGenerationErrorMessage(error) {
+  const raw = (error && error.message) || String(error);
+  const hint =
+    "This usually means the configured image model can't produce images or your API key can't access it. " +
+    "Set **GEMINI_IMAGE_MODEL** in `.env` to a current image model (e.g. `gemini-3.1-flash-image`), " +
+    "restart the bot, and try again.";
+  if (raw.includes("GEMINI_API_KEY")) return `❌ **GEMINI_API_KEY** is missing in \`.env\`.`;
+  if (raw.includes("blocked by safety filters")) return "❌ Image generation was blocked by safety filters — try a different prompt.";
+  if (raw.includes("All image models failed")) return `❌ Image generation failed. ${hint}`;
+  return `❌ Image generation failed: ${raw} ${hint}`;
+}
+
+// ---- /imagine & /analyze handlers ----------------------------------------
+async function handleImagineCommand(interaction) {
+  const prompt = (interaction.options.getString("prompt") || "").trim();
+  if (!process.env.GEMINI_API_KEY) {
+    await interaction.reply({
+      content:
+        "❌ **GEMINI_API_KEY** is not set in `.env`. Add your Google Gemini API key, " +
+        "restart the bot, then run `/imagine` again.",
+      ephemeral: true,
+    });
+    return;
+  }
+  if (!prompt) {
+    await interaction.reply({
+      content: "❌ Please describe the image you want to create.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.deferReply();
+  try {
+    // Optional reference image -> the request becomes an image *edit*.
+    const reference = interaction.options.getAttachment("reference");
+    const referenceParts = reference ? await prepareImageReferenceParts([reference]) : [];
+    const { buffer, mime, model } = await generateImageFromPrompt(prompt, referenceParts);
+    const file = await attachmentFromImageBuffer(buffer, mime, "generated_image");
+    const caption = referenceParts.length > 0 ? "edited your image" : "your image";
+    await interaction.editReply({
+      content: `🎨 Here's ${caption}!\n**${prompt}**`,
+      files: [file],
+    });
+    if (model !== IMAGE_MODELS[0]) console.log(`🎨 Generated image with fallback model: ${model}`);
+  } catch (error) {
+    console.error("❌ /imagine error:", error.message);
+    const message = error.message || String(error);
+    await interaction
+      .editReply({
+        content: error.isAnalysis || message.startsWith("❌") ? message : imageGenerationErrorMessage(error),
+      })
+      .catch(() => {});
+  }
+}
+
+async function handleAnalyzeCommand(interaction) {
+  const attachment = interaction.options.getAttachment("file");
+  if (!process.env.GEMINI_API_KEY) {
+    await interaction.reply({
+      content:
+        "❌ **GEMINI_API_KEY** is not set in `.env`. Add your Google Gemini API key, " +
+        "restart the bot, then run `/analyze` again.",
+      ephemeral: true,
+    });
+    return;
+  }
+  if (!attachment) {
+    await interaction.reply({
+      content: "❌ Please attach a file to analyze.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.deferReply();
+  try {
+    // One-shot analysis: no conversation memory, a longer answer budget.
+    const { reply, model } = await askGemini(interaction.guildId, "", {
+      attachments: [attachment],
+      includeHistory: false,
+      maxOutputTokens: MAX_OUTPUT_TOKENS * 2,
+    });
+    if (model !== GEMINI_MODELS[0]) console.log(`🤖 /analyze answered with fallback model: ${model}`);
+    const chunks = splitLongText(`📄 **Analysis of ${attachment.name}:**\n\n${reply}`);
+    await interaction.editReply(chunks[0]);
+    for (const chunk of chunks.slice(1)) {
+      await interaction.followUp(chunk);
+    }
+  } catch (error) {
+    console.error("❌ /analyze error:", error.message);
+    const message = error.message || String(error);
+    await interaction
+      .editReply({
+        content: error.isAnalysis || message.startsWith("❌") ? message : `❌ Failed to analyze the file. ${message}`,
+      })
+      .catch(() => {});
+  }
 }
 
 // ---- Queue configuration -------------------------------------------------
@@ -200,6 +707,29 @@ const commands = [
   new SlashCommandBuilder()
     .setName("newtask")
     .setDescription("Start a fresh Nexora AI conversation (forgets chat history)"),
+  new SlashCommandBuilder()
+    .setName("analyze")
+    .setDescription("Analyze an image, video, audio, PDF, Word, Excel, PowerPoint, or code file")
+    .addAttachmentOption((option) =>
+      option.setName("file").setDescription("The file to analyze").setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("imagine")
+    .setDescription("Generate an image from a text description (attach a reference image to edit it)")
+    .addStringOption((option) =>
+      option
+        .setName("prompt")
+        .setDescription("Describe the image you want, e.g. a red dragon flying over a castle")
+        .setRequired(true)
+        .setMinLength(1)
+        .setMaxLength(2000)
+    )
+    .addAttachmentOption((option) =>
+      option
+        .setName("reference")
+        .setDescription("Optional image to use as a reference — describe the change you want in the prompt")
+        .setRequired(false)
+    ),
 ].map((command) => command.toJSON());
 
 // Register slash commands
@@ -515,11 +1045,11 @@ function updatePresence() {
   }
 }
 
-// Download image with axios and retry logic
-async function downloadImage(url, retries = 3) {
+// Download a file (image, video, audio, document, ...) with axios and retry logic
+async function downloadFile(url, retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      console.log(`📥 Downloading image (attempt ${attempt}/${retries})...`);
+      console.log(`📥 Downloading file (attempt ${attempt}/${retries})...`);
       const response = await axios.get(url, {
         responseType: "arraybuffer",
         timeout: 60000, // 60 second timeout
@@ -527,12 +1057,12 @@ async function downloadImage(url, retries = 3) {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         },
       });
-      console.log("✅ Image downloaded successfully!");
+      console.log("✅ File downloaded successfully!");
       return Buffer.from(response.data);
     } catch (error) {
       console.error(`❌ Download attempt ${attempt} failed:`, error.message);
       if (attempt === retries) {
-        throw new Error(`Failed to download image after ${retries} attempts: ${error.message}`);
+        throw new Error(`Failed to download file after ${retries} attempts: ${error.message}`);
       }
       // Wait before retry
       await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
@@ -622,78 +1152,149 @@ async function updateWaitingPanels() {
   await Promise.allSettled(jobs);
 }
 
-// The actual image processing. Everything from download to sending the result.
+// ---- Background removal core (shared by /removebg and chat requests) ------
+// Runs the local background-removal model on an already-downloaded image and
+// returns a finished PNG buffer no larger than Discord's 8MB upload limit.
+async function removeBackgroundFromBuffer(imageBuffer, contentType) {
+  // ---- Aspect-correct inference ----
+  // The library resizes every image to a 1024x1024 square before running the
+  // model. For non-square photos that stretches the subject, which makes the
+  // cutout less precise. Padding the input to a square canvas first keeps the
+  // subject undistorted during inference; we crop back to the exact original
+  // pixel dimensions afterwards, so the result keeps its original resolution.
+  const metadata = await sharp(imageBuffer).metadata();
+  const { width, height } = metadata;
+  let inferenceBlob = new Blob([imageBuffer], { type: contentType });
+  let cropRect = null;
+  if (width && height && width !== height && Math.max(width, height) <= MAX_PAD_CANVAS) {
+    const side = Math.max(width, height);
+    console.log(`📐 Padding ${width}x${height} to ${side}x${side} for accurate inference...`);
+    const padded = await sharp({
+      create: {
+        width: side,
+        height: side,
+        channels: 4,
+        background: { r: 0, g: 0, b: 0, alpha: 0 }, // transparent pad
+      },
+    })
+      .composite([{ input: imageBuffer }]) // original image anchored top-left
+      .png()
+      .toBuffer();
+    inferenceBlob = new Blob([padded], { type: "image/png" });
+    cropRect = { left: 0, top: 0, width, height };
+  }
+
+  // Remove background with timeout.
+  // The image is passed as a Blob carrying its MIME type (the library decodes
+  // based on the blob's type; raw Buffers/absolute Windows paths do not work).
+  console.log("🎨 Removing background...");
+  let lastLoggedPercent = -1;
+  const result = await Promise.race([
+    removeBackground(new Blob([imageBuffer], { type: contentType }), {
+      output: { format: "image/png" },
+      model: "medium",
+      progress: (key, current, total) => {
+        const percent = total > 0 ? Math.floor((current / total) * 100) : 0;
+        if (percent !== lastLoggedPercent && (percent === 0 || percent === 100 || percent - lastLoggedPercent >= 10)) {
+          lastLoggedPercent = percent;
+          console.log(`⏳ Progress: ${key} - ${percent}%`);
+        }
+      },
+    }),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Background removal timed out")), PROCESS_TIMEOUT_MS)
+    ),
+  ]);
+
+  // removeBackground resolves to a Blob, which fs/Buffer APIs can't consume
+  // directly, so convert it to a Buffer.
+  let resultBuffer = Buffer.from(await result.arrayBuffer());
+
+  // Restore the original (possibly non-square) resolution by removing the pad.
+  if (cropRect) {
+    console.log("✂️ Restoring original resolution...");
+    resultBuffer = await sharp(resultBuffer).extract(cropRect).png().toBuffer();
+  }
+
+  // Check result file size (Discord limit is 8MB for bots)
+  if (resultBuffer.byteLength > MAX_FILE_SIZE) {
+    throw new Error("Result image too large for Discord");
+  }
+
+  return resultBuffer;
+}
+
+// Image types accepted by the background remover.
+const BG_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+
+function isBgRemovableAttachment(attachment) {
+  return (
+    attachment &&
+    attachment.contentType &&
+    BG_IMAGE_TYPES.has(attachment.contentType) &&
+    attachment.size <= MAX_FILE_SIZE
+  );
+}
+
+// Phrases that mean "remove the background of this image" in a chat message.
+// Only acted on when the message actually carries an image attachment.
+function looksLikeRemoveBgRequest(text) {
+  const t = (text || "").trim();
+  return (
+    /\bremove\s+(?:the\s+)?(?:background|bg)\b/i.test(t) ||
+    /\bbg\s*remov(?:e|al|er|ing)?\b/i.test(t) ||
+    /\bremovebg\b/i.test(t) ||
+    /\b(?:hapus|buang|hilangkan|ilangin)\s+(?:background|bg|latar(?:\s+belakang)?)(?:nya)?\b/i.test(t) ||
+    /\b(?:background|bg|latar(?:\s+belakang)?)(?:nya)?\s+(?:di)?hapus\b/i.test(t) ||
+    /\b(?:background|latar(?:\s+belakang)?)\s*remover\b/i.test(t)
+  );
+}
+
+// Chat-originated background removal: same pipeline as /removebg, replying to
+// the message instead of editing a slash-command panel. Takes one slot from the
+// shared pool so the local model never runs unbounded.
+async function runChatBackgroundRemoval(message, attachment) {
+  if (activeCount >= MAX_CONCURRENT_TASKS) {
+    await message
+      .reply(
+        "⏳ All background-removal slots are busy right now — try again in a moment, or use `/removebg` which queues automatically."
+      )
+      .catch(() => {});
+    return;
+  }
+  activeCount += 1;
+  try {
+    await message.channel.sendTyping();
+    console.log("🧹 Chat remove-bg request detected — processing image...");
+    const imageBuffer = await downloadFile(attachment.url);
+    const resultBuffer = await removeBackgroundFromBuffer(imageBuffer, attachment.contentType);
+    const resultAttachment = new AttachmentBuilder(resultBuffer, {
+      name: "removed_background.png",
+    });
+    await message.reply({
+      content: "✅ **Background removed!** 💙",
+      files: [resultAttachment],
+    });
+    console.log("✅ Chat remove-bg processed and sent!");
+  } catch (error) {
+    console.error("❌ Chat remove-bg error:", error.message);
+    await message.reply(friendlyError(error)).catch(() => {});
+  } finally {
+    activeCount -= 1;
+    dispatch();
+  }
+}
+
+// The actual /removebg processing. Everything from download to sending the result.
 async function runJob({ interaction, attachment }) {
   try {
     await interaction.editReply({ embeds: [processingPanelEmbed()] });
 
     // Download the image with retry
-    const imageBuffer = await downloadImage(attachment.url);
+    const imageBuffer = await downloadFile(attachment.url);
 
-    // ---- Aspect-correct inference ----
-    // The library resizes every image to a 1024x1024 square before running the
-    // model. For non-square photos that stretches the subject, which makes the
-    // cutout less precise. Padding the input to a square canvas first keeps the
-    // subject undistorted during inference; we crop back to the exact original
-    // pixel dimensions afterwards, so the result keeps its original resolution.
-    const metadata = await sharp(imageBuffer).metadata();
-    const { width, height } = metadata;
-    let inferenceBlob = new Blob([imageBuffer], { type: attachment.contentType });
-    let cropRect = null;
-    if (width && height && width !== height && Math.max(width, height) <= MAX_PAD_CANVAS) {
-      const side = Math.max(width, height);
-      console.log(`📐 Padding ${width}x${height} to ${side}x${side} for accurate inference...`);
-      const padded = await sharp({
-        create: {
-          width: side,
-          height: side,
-          channels: 4,
-          background: { r: 0, g: 0, b: 0, alpha: 0 }, // transparent pad
-        },
-      })
-        .composite([{ input: imageBuffer }]) // original image anchored top-left
-        .png()
-        .toBuffer();
-      inferenceBlob = new Blob([padded], { type: "image/png" });
-      cropRect = { left: 0, top: 0, width, height };
-    }
-
-    // Remove background with timeout.
-    // The image is passed as a Blob carrying its MIME type (the library decodes
-    // based on the blob's type; raw Buffers/absolute Windows paths do not work).
-    console.log("🎨 Removing background...");
-    let lastLoggedPercent = -1;
-    const result = await Promise.race([
-      removeBackground(new Blob([imageBuffer], { type: attachment.contentType }), {
-        output: { format: "image/png" },
-        model: "medium",
-        progress: (key, current, total) => {
-          const percent = total > 0 ? Math.floor((current / total) * 100) : 0;
-          if (percent !== lastLoggedPercent && (percent === 0 || percent === 100 || percent - lastLoggedPercent >= 10)) {
-            lastLoggedPercent = percent;
-            console.log(`⏳ Progress: ${key} - ${percent}%`);
-          }
-        },
-      }),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Background removal timed out")), PROCESS_TIMEOUT_MS)
-      ),
-    ]);
-
-    // removeBackground resolves to a Blob, which fs/Buffer APIs can't consume
-    // directly, so convert it to a Buffer.
-    let resultBuffer = Buffer.from(await result.arrayBuffer());
-
-    // Restore the original (possibly non-square) resolution by removing the pad.
-    if (cropRect) {
-      console.log("✂️ Restoring original resolution...");
-      resultBuffer = await sharp(resultBuffer).extract(cropRect).png().toBuffer();
-    }
-
-    // Check result file size (Discord limit is 8MB for bots)
-    if (resultBuffer.byteLength > MAX_FILE_SIZE) {
-      throw new Error("Result image too large for Discord");
-    }
+    // Remove the background (aspect-correction padding & cropping handled inside)
+    const resultBuffer = await removeBackgroundFromBuffer(imageBuffer, attachment.contentType);
 
     // Send result: the loading panel is updated into a green "done" panel,
     // and the finished image is attached alongside it.
@@ -861,6 +1462,16 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
+  if (interaction.commandName === "analyze") {
+    await handleAnalyzeCommand(interaction);
+    return;
+  }
+
+  if (interaction.commandName === "imagine") {
+    await handleImagineCommand(interaction);
+    return;
+  }
+
   if (interaction.commandName !== "removebg") return;
 
   try {
@@ -913,32 +1524,97 @@ client.on("messageCreate", async (message) => {
       "📋 **Available Commands:**\n" +
         "`/removebg` - Remove background from an image\n" +
         "`/status` - Check bot status (latency, CPU, RAM, uptime)\n" +
-      "`/set` - Turn this channel into a Nexora AI chat channel\n" +
-      "`/newtask` - Forget the current Nexora AI chat and start fresh\n" +
-      "Just use the slash command and attach an image!"
+        "`/set` - Turn this channel into a Nexora AI chat channel\n" +
+        "`/newtask` - Forget the current Nexora AI chat and start fresh\n" +
+        "`/analyze` - Analyze any file (image, mp4, mp3, PDF, Word, PPTX, Excel, code...)\n" +
+        "`/imagine` - Generate an image from a description; attach a reference image to edit it\n" +
+        "💡 In an AI chat channel (`/set`) you can also just attach a file with your " +
+        "message and Nexora will analyze it, write e.g. `buatkan gambar kucing` to " +
+        "generate one, attach a photo + `ubah latarnya jadi pantai` to edit it, or " +
+        "attach a photo + `hapus background` to remove its background!"
     );
   }
 
-  // Nexora AI: reply to every message in a registered chat channel
+  // Nexora AI: reply to every message in a registered chat channel. Text-only
+  // messages get a Gemini reply; messages with attachments get the file(s)
+  // analyzed too (images, video, audio, PDFs, Office documents, source code...).
   const aiChannelId = aiChannels.get(message.guildId);
   if (aiChannelId && message.channelId === aiChannelId) {
     const text = message.content.trim();
-    if (!text) return;
+    const attachments = [...message.attachments.values()];
+    if (!text && attachments.length === 0) return;
     try {
       await message.channel.sendTyping();
-      const { reply, model } = await askGemini(message.guildId, text);
-      // Remember both sides so the next message has full context.
+
+      // "remove bg" / "hapus background" + attached image -> run the exact
+      // same pipeline as /removebg instead of an AI answer.
+      if (text && attachments.length > 0 && looksLikeRemoveBgRequest(text)) {
+        const bgImage = attachments.find(isBgRemovableAttachment);
+        if (!bgImage) {
+          await message.reply(
+            "❌ To remove a background, attach an image (PNG, JPEG, or WebP) up to 8MB together with your request."
+          );
+          return;
+        }
+        await runChatBackgroundRemoval(message, bgImage);
+        return;
+      }
+
+      // Image requests ("buatkan gambar ...", "/imagine ...", ...) are routed to
+      // the dedicated image-generation model. If images are attached they are
+      // used as references, so the prompt becomes an editing instruction
+      // (e.g. attach a photo + "ubah latarnya jadi pantai").
+      const wantsImageEdit =
+        attachments.length > 0 && looksLikeImageEditRequest(text);
+      if (text && (looksLikeImageRequest(text) || wantsImageEdit)) {
+        const prompt = text.replace(/^\/imagine\b/, "").trim() || text;
+        const referenceParts = attachments.length > 0 ? await prepareImageReferenceParts(attachments) : [];
+        const { buffer, mime, model } = await generateImageFromPrompt(prompt, referenceParts);
+        const file = await attachmentFromImageBuffer(buffer, mime, "nexora_image");
+        const caption =
+          referenceParts.length > 0
+            ? `🎨 Edited from your image${referenceParts.length > 1 ? "s" : ""}! **${prompt}**`
+            : `🎨 Here you go! **${prompt}**`;
+        await message.reply({ content: caption, files: [file] });
+        if (model !== IMAGE_MODELS[0]) {
+          console.log(`🎨 Nexora generated an image with fallback model: ${model}`);
+        }
+        return;
+      }
+
+      const { reply, model } = await askGemini(message.guildId, text, { attachments });
+      // Remember both sides so the next message has full context. Attachments
+      // are not stored in memory — only the text the user wrote.
       const history = conversationMemory.get(message.guildId) || [];
-      history.push({ role: "user", text }, { role: "model", text: reply });
+      const userText =
+        text ||
+        (attachments.length > 0
+          ? `(asked me to look at ${attachments.length} attached file${attachments.length > 1 ? "s" : ""})`
+          : "");
+      history.push({ role: "user", text: userText }, { role: "model", text: reply });
       while (history.length > MAX_HISTORY_MESSAGES) history.shift();
       conversationMemory.set(message.guildId, history);
       if (model !== GEMINI_MODELS[0]) {
         console.log(`🤖 Nexora AI answered with fallback model: ${model}`);
       }
-      await message.reply(reply);
+      const chunks = splitLongText(reply);
+      await message.reply(chunks[0]);
+      for (const chunk of chunks.slice(1)) {
+        await message.channel.send(chunk);
+      }
     } catch (error) {
       console.error("❌ Nexora AI error:", error.message);
-      const message_ = error.message;
+      const message_ = error.message || String(error);
+      // File-analysis and image-generation errors already carry a complete,
+      // user-friendly explanation — surface them as-is.
+      if (error.isAnalysis) {
+        await message.reply(message_).catch(() => {});
+        return;
+      }
+      if (error.isImage) {
+        await message.reply(imageGenerationErrorMessage(error)).catch(() => {});
+        return;
+      }
       let hint;
       if (message_.includes("GEMINI_API_KEY")) {
         hint = "Set **GEMINI_API_KEY** in `.env`, restart the bot, then try again.";
