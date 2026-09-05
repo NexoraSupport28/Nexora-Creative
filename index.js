@@ -70,8 +70,9 @@ const IMAGE_MODELS = (() => {
 })();
 const NEXORA_SYSTEM_PROMPT =
   "You are Nexora AI, a friendly and helpful AI assistant in a Discord server. " +
-  "You can see and analyze the files users attach to the conversation " +
-  "(images, audio, video, PDFs, Word/Excel/PowerPoint, and source code). " +
+  "You can see and analyze almost any file users attach to the conversation: " +
+  "images, audio, video, PDFs, Office documents, and any text/code file " +
+  "(whatever its extension — the content is read directly). " +
   "Detect the language the user writes in — and when files are attached, also " +
   "consider the language of the file contents — then answer in that language " +
   "(Indonesian stays Indonesian, English stays English). If no language can be " +
@@ -302,10 +303,16 @@ async function detectLanguageOfRequest(userText, attachments) {
     const ext = path.extname(displayName).slice(1).toLowerCase();
     const mime = normalizeAttachmentMime(attachment, ext);
     const kind = classifyAttachmentFile(mime, ext, displayName.toLowerCase());
-    if (kind !== "text") continue; // binary media/docs are read by the model itself
+    // Only files that end up being read as text influence the detected
+    // language; binary media/docs are understood by the model itself. Files
+    // with unknown extensions are downloaded and sniffed too, so a text file
+    // with an odd extension still steers the reply language.
+    if (kind !== "text" && kind !== "unsupported") continue;
     try {
       const buffer = await downloadFile(attachment.url);
-      samples.push(buffer.toString("utf8").slice(0, LANG_SAMPLE_CHARS));
+      if (kind === "unsupported" && !looksLikeReadableText(buffer)) continue;
+      const { text } = decodeBufferToText(buffer);
+      samples.push(text.slice(0, LANG_SAMPLE_CHARS));
     } catch (error) {
       console.warn("⚠️ Could not sample attachment for language detection:", error.message);
     }
@@ -495,31 +502,96 @@ const EXTENSION_MIME = {
 // Every MIME in EXTENSION_MIME can be sent to Gemini as inline data.
 const SUPPORTED_MEDIA_MIMES = new Set(Object.values(EXTENSION_MIME));
 
-// Extensions treated as plain text / source code (read locally, then sent as a
-// text part so Gemini never needs to know each language's MIME type).
+// Image types Gemini can't take inline, but that sharp can decode locally —
+// they are converted to PNG (see prepareAttachmentParts) before being sent.
+const EXTENSION_MIME_TRANSCODE = {
+  tif: "image/tiff",
+  tiff: "image/tiff",
+  avif: "image/avif",
+};
+const TRANSCODE_MIME_TYPES = new Set(Object.values(EXTENSION_MIME_TRANSCODE));
+const TRANSCODE_OUTPUT_MIME = "image/png";
+
+// Human-readable summary of everything the bot can analyze. Reused by errors
+// and help text so the two never drift apart.
+const ANALYSIS_CAPABILITIES_TEXT =
+  "Supported: images (PNG/JPEG/WebP/HEIC — TIFF & AVIF are converted automatically), " +
+  "audio (MP3/WAV/OGG/AAC/FLAC/AIFF), video (MP4/MOV/WebM/AVI/MKV/MPEG/WMV), " +
+  "documents (PDF, Word, Excel, PowerPoint, RTF), and any text/code file — a file " +
+  "with an unknown extension is checked for readable text automatically. " +
+  "Pure-binary formats (executables like .exe/.dll, archives like .zip/.rar, " +
+  "disk images, 3D models, databases) have no readable text, so they can't be " +
+  "analyzed as-is.";
+
+// Every extension listed here is treated as plain text / source code: the
+// file is read locally and its content sent to Gemini as a text part, so the
+// bot can "open" hundreds of formats Gemini has never heard of — source code,
+// configs, markup, data dumps, subtitles, log files, scripts and more.
 const TEXT_FILE_EXTENSIONS = new Set([
-  "txt", "md", "markdown", "log", "csv", "tsv", "json", "js", "mjs", "cjs",
-  "jsx", "ts", "tsx", "py", "ipynb", "java", "c", "h", "cc", "cpp", "cxx",
-  "hpp", "cs", "go", "rs", "php", "rb", "sh", "bash", "zsh", "ksh", "ps1",
-  "bat", "cmd", "yaml", "yml", "xml", "html", "htm", "css", "scss", "sass",
-  "less", "sql", "ini", "cfg", "conf", "toml", "env", "gitignore", "vue",
-  "svelte", "kt", "kts", "swift", "scala", "lua", "pl", "pm", "r", "dart",
-  "ex", "exs", "erl", "hrl", "clj", "cljs", "edn", "hs", "elm", "ml", "fs",
-  "vb", "asm", "sol", "graphql", "gql", "proto", "tf", "tfvars", "hcl", "pug",
-  "ejs", "hbs", "twig", "lock", "properties", "jsp", "asp", "aspx", "m", "mm",
-  "gradle", "awk", "sed", "tex", "rtf",
+  // Plain text, documents & markup
+  "txt", "text", "log", "nfo", "diz", "md", "markdown", "mdown", "mkd",
+  "mkdn", "rmd", "qmd", "mdx", "rst", "adoc", "asciidoc", "org",
+  "textile", "wiki", "creole", "abw", "tex", "latex", "bib", "rtf",
+  "asc", "hex", "eml", "ics", "vcard",
+  // Data interchange & config
+  "csv", "tsv", "vcf", "json", "json5", "jsonc", "jsonl", "ndjson",
+  "geojson", "topojson", "xml", "xhtml", "svg", "yaml", "yml", "toml",
+  "ini", "cfg", "conf", "config", "cnf", "properties", "plist", "env",
+  "gitignore", "lock", "desktop", "rdp", "reg", "inf", "service",
+  "sql", "graphql", "gql", "proto", "textproto", "xsd", "xsl", "xslt",
+  "xqy", "xquery", "dtd",
+  // Web front-end & templating
+  "html", "htm", "hta", "phtml", "css", "scss", "sass", "less", "styl",
+  "pcss", "vue", "svelte", "astro", "js", "mjs", "cjs", "jsx", "ts",
+  "tsx", "pug", "ejs", "hbs", "twig", "jsp", "asp", "aspx", "cfm",
+  "cfc", "cfml",
+  // Scripting, shells & automation
+  "py", "pyw", "pyi", "ipynb", "rb", "php", "pl", "pm", "pod", "lua",
+  "tcl", "r", "jl", "sh", "bash", "zsh", "ksh", "fish", "csh", "tcsh",
+  "ps1", "psm1", "psd1", "ps1xml", "bat", "cmd", "vbs", "wsf", "awk",
+  "sed", "groovy", "gvy", "gradle", "nim", "odin", "d", "di", "pas",
+  "pp", "vala", "vapi", "ex", "exs", "erl", "hrl", "clj", "cljs",
+  "cljc", "edn", "coffee", "litcoffee", "cson", "hs", "lhs", "elm",
+  "ml", "mli", "fs", "fsx", "fsi", "fsscript", "scala", "sc", "re",
+  "rei", "agda", "ahk", "applescript", "au3", "asm", "nasm", "s",
+  "inc", "cgi", "jad", "mscript", "vim", "qml", "lisp", "lsp", "scm",
+  "ss", "cl",
+  // Compiled-language source
+  "c", "h", "cc", "cpp", "cxx", "c++", "hpp", "hh", "hxx", "h++",
+  "inl", "ipp", "ixx", "m", "mm", "cs", "java", "go", "rs", "swift",
+  "kt", "kts", "dart", "cob", "cbl", "cpy", "f", "for", "f77", "f90",
+  "f95", "f03", "f08", "ada", "adb", "ads", "vb", "vhdl", "sv", "svh",
+  "v", "zig", "gd", "ino", "sol", "tf", "tfvars", "hcl", "pbtxt",
+  "ron", "yang",
+  // Build systems, patches & misc text
+  "make", "mk", "ninja", "diff", "patch", "rej", "lic", "sig", "x_b",
+  "x_t",
+  // Biology / science plain-text data
+  "fa", "fasta", "fastq", "fq", "bed", "gff", "gtf", "sam", "vcf",
+  "smiles", "gcode",
 ]);
 // Files whose *name* (no extension) marks them as text: Dockerfile, Makefile...
 const TEXT_FILE_NAMES = new Set([
   "dockerfile", "makefile", "gemfile", "rakefile", "procfile", "license",
-  "readme", "contributing", "changelog", "cmakelists.txt",
+  "licence", "copying", "readme", "contributing", "changelog", "authors",
+  "notice", "cmakelists.txt", "justfile", "meson.build", "build.ninja",
+  ".gitignore", "gitignore", ".gitattributes", ".gitmodules", ".dockerignore",
+  "dockerignore", ".editorconfig", "editorconfig", ".npmrc", ".yarnrc",
+  ".pnpmrc", ".babelrc", ".eslintrc", ".prettierrc", ".vimrc", "vimrc",
+  ".bashrc", "bashrc", ".zshrc", "zshrc", ".zprofile", ".bash_profile",
+  ".bash_aliases", ".profile", ".inputrc", ".hgrc", ".terraformrc",
+  ".gitconfig", "gitconfig", ".env", ".envrc", ".python-version",
+  ".nvmrc", ".node-version", ".tool-versions", ".curlrc", ".wgetrc",
+  ".screenrc",
 ]);
 // MIME types that are really text/code even though they don't start with text/.
 const TEXT_MIME_TYPES = new Set([
   "application/json", "application/xml", "application/javascript",
   "application/x-javascript", "application/x-python", "application/x-sh",
   "application/x-csh", "application/x-httpd-php", "application/ld+json",
-  "application/graphql",
+  "application/graphql", "application/x-yaml", "application/x-toml",
+  "application/sql", "application/x-perl", "application/x-ruby",
+  "application/x-lua", "application/x-shellscript", "application/x-erb",
 ]);
 
 function analysisError(kind, message) {
@@ -535,11 +607,12 @@ function analysisError(kind, message) {
 function normalizeAttachmentMime(attachment, ext) {
   const reported = (attachment.contentType || "").split(";")[0].trim().toLowerCase();
   if (reported && reported !== "application/octet-stream") return reported;
-  return EXTENSION_MIME[ext] || "application/octet-stream";
+  return EXTENSION_MIME[ext] || EXTENSION_MIME_TRANSCODE[ext] || "application/octet-stream";
 }
 
-// text -> read the bytes as UTF-8 and send them as a text part
+// text -> read the bytes and send them as a text part
 // media -> send as inlineData (image/audio/video/document)
+// transcode_image -> an image type Gemini can't take inline; PNG-converted first
 // unsupported -> the user gets a friendly error
 function classifyAttachmentFile(mime, ext, fileName) {
   if (
@@ -551,7 +624,70 @@ function classifyAttachmentFile(mime, ext, fileName) {
     return "text";
   }
   if (SUPPORTED_MEDIA_MIMES.has(mime)) return "media";
+  if (TRANSCODE_MIME_TYPES.has(mime) || EXTENSION_MIME_TRANSCODE[ext]) {
+    return "transcode_image";
+  }
   return "unsupported";
+}
+
+// ---- Reading text out of arbitrary bytes ----------------------------------
+// decodeBufferToText turns a buffer into text, honoring UTF-8 / UTF-16 byte
+// order marks. looksLikeReadableText decides whether the bytes of a file with
+// an unknown or made-up extension are really human-readable text, so such
+// files can be opened and read instead of being rejected.
+const { TextDecoder } = require("util");
+
+function decodeBufferToText(buffer) {
+  if (buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) {
+    return { text: buffer.subarray(3).toString("utf8"), encoding: "utf-8" };
+  }
+  if (buffer[0] === 0xff && buffer[1] === 0xfe) {
+    return { text: buffer.subarray(2).toString("utf16le"), encoding: "utf-16le" };
+  }
+  if (buffer[0] === 0xfe && buffer[1] === 0xff) {
+    const bigEndian = Buffer.from(buffer.subarray(2)).swap16();
+    return { text: bigEndian.toString("utf16le"), encoding: "utf-16be" };
+  }
+  return { text: buffer.toString("utf8"), encoding: "utf-8" };
+}
+
+// Heuristic: bytes are readable text when they decode cleanly as UTF-8 (or
+// start with a UTF-16 BOM) and contain very few control characters plus some
+// real letter/number content. Binary files almost never survive the strict
+// UTF-8 decode, and whatever does survive is checked for control characters.
+function looksLikeReadableText(buffer) {
+  if (!buffer || buffer.byteLength === 0) return false;
+  let text;
+  if (buffer[0] === 0xff && buffer[1] === 0xfe) {
+    text = buffer.subarray(2).toString("utf16le");
+  } else if (buffer[0] === 0xfe && buffer[1] === 0xff) {
+    text = Buffer.from(buffer.subarray(2)).swap16().toString("utf16le");
+  } else {
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+    } catch {
+      return false; // not valid UTF-8 text
+    }
+    if (text.charCodeAt(0) === 0xfeff) text = text.slice(1); // strip UTF-8 BOM
+  }
+  if (!text.trim()) return false;
+
+  const sample = text.slice(0, 65536);
+  let total = 0;
+  let control = 0;
+  let letters = 0;
+  for (const ch of sample) {
+    const cp = ch.codePointAt(0);
+    total += 1;
+    if (cp === 0x09 || cp === 0x0a || cp === 0x0d) continue; // tab / LF / CR
+    if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f)) {
+      control += 1;
+      continue;
+    }
+    if (/[\p{L}\p{N}]/u.test(ch)) letters += 1;
+  }
+  if (total === 0) return false;
+  return control / total <= 0.05 && letters >= 4;
 }
 
 // Turn a message's attachments into Gemini content parts. Throws an
@@ -580,35 +716,75 @@ async function prepareAttachmentParts(attachments) {
       );
     }
 
-    const mime = normalizeAttachmentMime(attachment, ext);
-    const kind = classifyAttachmentFile(mime, ext, fileName);
+    let mime = normalizeAttachmentMime(attachment, ext);
+    let kind = classifyAttachmentFile(mime, ext, fileName);
+
+    // Files that may still be readable need their real bytes: unknown types
+    // are sniffed for readable text, TIFF/AVIF images are converted to PNG.
+    let buffer = null;
+    if (kind === "unsupported" || kind === "transcode_image") {
+      buffer = await downloadFile(attachment.url);
+      if (buffer.byteLength > MAX_ANALYSIS_FILE_SIZE) {
+        throw analysisError(
+          "too_large",
+          `❌ **${displayName}** is ${formatBytes(buffer.byteLength)} after download — the per-file limit for analysis is ${formatBytes(MAX_ANALYSIS_FILE_SIZE)}.`
+        );
+      }
+      // Unknown extension but really just readable text (e.g. notes.dat with
+      // plain content, or a file with no extension at all) -> read it.
+      if (kind === "unsupported" && looksLikeReadableText(buffer)) kind = "text";
+    }
+
     if (kind === "unsupported") {
       throw analysisError(
         "unsupported",
-        `❌ **${displayName}** is a \`${mime}\` file, which I can't analyze. Supported: images (PNG/JPEG/WebP), audio (MP3/WAV/OGG/AAC/FLAC), video (MP4/MOV/WebM), PDF, Word, Excel, PowerPoint, and text/code files.`
+        `❌ **${displayName}** is a \`${mime}\` file with no readable text content, so I can't analyze it.\n${ANALYSIS_CAPABILITIES_TEXT}`
       );
     }
 
-    const buffer = await downloadFile(attachment.url);
-    if (buffer.byteLength > MAX_ANALYSIS_FILE_SIZE) {
-      throw analysisError(
-        "too_large",
-        `❌ **${displayName}** is ${formatBytes(buffer.byteLength)} after download — the per-file limit for analysis is ${formatBytes(MAX_ANALYSIS_FILE_SIZE)}.`
-      );
+    if (kind === "transcode_image") {
+      try {
+        buffer = await sharp(buffer).png().toBuffer();
+      } catch (error) {
+        console.warn(`⚠️ Could not convert ${displayName} (${mime}) to PNG:`, error.message);
+        throw analysisError(
+          "unsupported",
+          `❌ **${displayName}** looks like a \`${mime}\` image, but I couldn't decode it.\n${ANALYSIS_CAPABILITIES_TEXT}`
+        );
+      }
+      if (buffer.byteLength > MAX_ANALYSIS_FILE_SIZE) {
+        throw analysisError(
+          "too_large",
+          `❌ **${displayName}** is ${formatBytes(buffer.byteLength)} after PNG conversion — the per-file limit for analysis is ${formatBytes(MAX_ANALYSIS_FILE_SIZE)}.`
+        );
+      }
+      mime = TRANSCODE_OUTPUT_MIME; // image/png
+      kind = "media";
+    }
+
+    if (buffer === null) {
+      buffer = await downloadFile(attachment.url);
+      if (buffer.byteLength > MAX_ANALYSIS_FILE_SIZE) {
+        throw analysisError(
+          "too_large",
+          `❌ **${displayName}** is ${formatBytes(buffer.byteLength)} after download — the per-file limit for analysis is ${formatBytes(MAX_ANALYSIS_FILE_SIZE)}.`
+        );
+      }
     }
 
     if (kind === "text") {
-      let content = buffer.toString("utf8");
+      const { text: content } = decodeBufferToText(buffer);
+      let limited = content;
       let truncated = false;
-      if (content.length > MAX_TEXT_ATTACHMENT_CHARS) {
-        content = content.slice(0, MAX_TEXT_ATTACHMENT_CHARS);
+      if (limited.length > MAX_TEXT_ATTACHMENT_CHARS) {
+        limited = limited.slice(0, MAX_TEXT_ATTACHMENT_CHARS);
         truncated = true;
       }
       parts.push({
         text:
           `\n[Attachment ${i + 1}/${attachments.length}: \`${displayName}\`]\n` +
           "```\n" +
-          content +
+          limited +
           "\n```" +
           (truncated
             ? `\n…(file was truncated after ${MAX_TEXT_ATTACHMENT_CHARS} characters)\n`
@@ -706,14 +882,18 @@ function splitLongText(text, maxLength = 1900) {
 }
 
 // ---- Image generation -----------------------------------------------------
-// Native Gemini image models ("Nano Banana") return the picture as base64 in
-// candidates[].content.parts[].inlineData, requested with responseModalities.
+// Images come from two providers:
+//   1. Pollinations.ai — free, no API key, the default (see below).
+//   2. Gemini's native image models ("Nano Banana") — fallback, and the only
+//      option for reference-image editing (Pollinations' img2img is paid).
+// Gemini returns the picture as base64 in candidates[].content.parts[].inlineData,
+// requested with responseModalities.
 const IMAGE_GENERATION_TIMEOUT_MS = 180000;
 
 // referenceParts: optional inlineData parts for reference images. When present
 // the prompt is treated as an *editing* instruction (text-to-image-to-image)
 // instead of a from-scratch generation.
-async function generateImageFromPrompt(prompt, referenceParts = []) {
+async function generateImageWithGemini(prompt, referenceParts = []) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     const error = new Error("GEMINI_API_KEY is missing in .env");
@@ -784,6 +964,136 @@ async function generateImageFromPrompt(prompt, referenceParts = []) {
   throw error;
 }
 
+// ---- Image generation: Pollinations.ai (free, no API key) -----------------
+// Pollinations is the default image provider: free, no signup, and the Flux
+// model produces solid results. It answers directly with the finished image
+// bytes (GET /prompt/{prompt}). Access tiers:
+//   • anonymous: one request every 15 seconds, images carry a small watermark
+//   • free token (auth.pollinations.ai): one every 5s, watermark removed
+// A token is optional — the bot works fine without one.
+const POLLINATIONS_IMAGE_URL = "https://image.pollinations.ai";
+const POLLINATIONS_TOKEN = (process.env.POLLINATIONS_TOKEN || "").trim();
+const POLLINATIONS_MODEL = (process.env.POLLINATIONS_MODEL || "flux").trim() || "flux";
+// Minimum gap enforced between Pollinations requests (anonymous tier allows
+// 1 per 15s; a token raises it to 1 per 5s). Configurable via env.
+const POLLINATIONS_MIN_INTERVAL_MS = (() => {
+  const fallback = POLLINATIONS_TOKEN ? 5000 : 15000;
+  const raw = Number(process.env.POLLINATIONS_MIN_INTERVAL_MS);
+  return Number.isFinite(raw) && raw >= 1000 ? Math.floor(raw) : fallback;
+})();
+// Never make a user wait longer than this for a free Pollinations slot.
+const POLLINATIONS_MAX_WAIT_MS = 60000;
+
+// Pollinations requests are serialized and spaced by POLLINATIONS_MIN_INTERVAL_MS
+// so the anonymous rate limit is never tripped by a burst of requests.
+let pollinationsLastRequestAt = 0;
+let pollinationsQueue = Promise.resolve();
+
+function pollinationsThrottle() {
+  const attempt = async () => {
+    const waitMs = pollinationsLastRequestAt + POLLINATIONS_MIN_INTERVAL_MS - Date.now();
+    if (waitMs > POLLINATIONS_MAX_WAIT_MS) {
+      const error = new Error(
+        `❌ The free image API is busy (anonymous tier: one image every ${POLLINATIONS_MIN_INTERVAL_MS / 1000}s). ` +
+          "Wait a moment and try again — or register a free token at https://auth.pollinations.ai " +
+          "and set **POLLINATIONS_TOKEN** in `.env` for faster generation."
+      );
+      error.isImage = true;
+      throw error;
+    }
+    if (waitMs > 0) await sleep(waitMs);
+    pollinationsLastRequestAt = Date.now();
+  };
+  const next = pollinationsQueue.then(attempt, attempt);
+  pollinationsQueue = next.catch(() => {}); // keep the chain alive on errors
+  return next;
+}
+
+// Generate an image with Pollinations. Its image-to-image model ("kontext")
+// is enterprise-only, so this handles plain text-to-image with the configured
+// model (default flux) — reference-image edits go straight to Gemini.
+async function generateImageWithPollinations(prompt) {
+  await pollinationsThrottle();
+  const params = new URLSearchParams({
+    model: POLLINATIONS_MODEL,
+    width: "1024",
+    height: "1024",
+    nologo: POLLINATIONS_TOKEN ? "true" : "false",
+    private: "true", // keep generated images out of Pollinations' public feed
+    safe: "true", // strict NSFW filtering
+  });
+  const url = `${POLLINATIONS_IMAGE_URL}/prompt/${encodeURIComponent(prompt)}?${params.toString()}`;
+  const headers = POLLINATIONS_TOKEN ? { Authorization: `Bearer ${POLLINATIONS_TOKEN}` } : {};
+  const response = await axios.get(url, {
+    responseType: "arraybuffer",
+    timeout: IMAGE_GENERATION_TIMEOUT_MS,
+    headers,
+  });
+  const contentType = (response.headers["content-type"] || "image/jpeg").split(";")[0].trim();
+  // Errors are sometimes delivered as JSON even with a 200 status.
+  if (contentType.includes("json")) {
+    let detail = "unknown error";
+    try {
+      detail = JSON.parse(response.data.toString("utf8")).error || detail;
+    } catch {
+      /* keep default detail */
+    }
+    throw new Error(`Pollinations returned an error: ${detail}`);
+  }
+  const buffer = Buffer.from(response.data);
+  if (!buffer || buffer.byteLength === 0) {
+    throw new Error("Pollinations returned an empty image");
+  }
+  return {
+    buffer,
+    mime: contentType.startsWith("image/") ? contentType : "image/jpeg",
+    model: `pollinations-${POLLINATIONS_MODEL}`,
+  };
+}
+
+// Route an image request to a working provider.
+//   • reference-image edits → Gemini only (Pollinations' img2img is paid).
+//     Google's free tier allows 0 image requests, so without billing the user
+//     gets a clear explanation instead of a cryptic failure.
+//   • plain text-to-image → free Pollinations first, Gemini as a fallback.
+async function generateImageFromPrompt(prompt, referenceParts = []) {
+  if (referenceParts.length > 0) {
+    try {
+      return await generateImageWithGemini(prompt, referenceParts);
+    } catch (geminiError) {
+      console.warn(`⚠️ Gemini image models failed for edit: ${geminiError.message}`);
+      const error = new Error(
+        `❌ Image editing needs Gemini's image models, and Google's free tier allows 0 image requests ` +
+          `(your key returned: ${geminiError.message}). Enable billing on the **GEMINI_API_KEY** in Google ` +
+          `AI Studio — or generate a brand-new image instead (without a reference image), which is free.`
+      );
+      error.isImage = true;
+      throw error;
+    }
+  }
+
+  try {
+    return await generateImageWithPollinations(prompt);
+  } catch (pollinationsError) {
+    console.warn(`⚠️ Pollinations image generation failed: ${pollinationsError.message}`);
+    try {
+      return await generateImageWithGemini(prompt, []);
+    } catch (geminiError) {
+      console.warn(`⚠️ Gemini image models failed: ${geminiError.message}`);
+      const error = new Error(
+        `❌ Image generation failed.\n` +
+          `• Free API (Pollinations): ${pollinationsError.message}\n` +
+          `• Gemini: ${geminiError.message}\n\n` +
+          "The free API may be temporarily down or rate-limited (one image per 15s without a token). " +
+          "Try again in a moment. For watermark-free images and faster limits, register a free token " +
+          "at https://auth.pollinations.ai and set **POLLINATIONS_TOKEN** in `.env`."
+      );
+      error.isImage = true;
+      throw error;
+    }
+  }
+}
+
 // Wrap a generated image as a Discord attachment, recompressing to WebP when
 // the raw output would exceed Discord's 8MB upload limit.
 async function attachmentFromImageBuffer(buffer, mime, stem) {
@@ -850,10 +1160,10 @@ function looksLikeBareImageRequest(text) {
 
 function imageGenerationErrorMessage(error) {
   const raw = (error && error.message) || String(error);
+  if (raw.startsWith("❌")) return raw; // already a complete, user-friendly message
   const hint =
-    "This usually means the configured image model can't produce images or your API key can't access it. " +
-    "Set **GEMINI_IMAGE_MODEL** in `.env` to a current image model (e.g. `gemini-3.1-flash-image`), " +
-    "restart the bot, and try again.";
+    "Image generation uses Pollinations.ai (free, no key) by default. If it keeps failing, " +
+    "the service may be down or rate-limited (anonymous tier: one image per 15s) — try again in a moment.";
   if (raw.includes("GEMINI_API_KEY")) return `❌ **GEMINI_API_KEY** is missing in \`.env\`.`;
   if (raw.includes("blocked by safety filters")) return "❌ Image generation was blocked by safety filters — try a different prompt.";
   if (raw.includes("All image models failed")) return `❌ Image generation failed. ${hint}`;
@@ -892,7 +1202,9 @@ async function handleImagineCommand(interaction) {
       content: `🎨 Here's ${caption}!\n**${prompt}**`,
       files: [file],
     });
-    if (model !== IMAGE_MODELS[0]) console.log(`🎨 Generated image with fallback model: ${model}`);
+    if (model && model.startsWith("gemini") && model !== IMAGE_MODELS[0]) {
+      console.log(`🎨 Generated image with fallback model: ${model}`);
+    }
   } catch (error) {
     console.error("❌ /imagine error:", error.message);
     const message = error.message || String(error);
@@ -1021,7 +1333,7 @@ const commands = [
     .setDescription("Start a fresh Nexora AI conversation (forgets chat history)"),
   new SlashCommandBuilder()
     .setName("analyze")
-    .setDescription("Analyze an image, video, audio, PDF, Word, Excel, PowerPoint, or code file")
+    .setDescription("Analyze a file: image, video, audio, PDF, Office doc, or any text/code file")
     .addAttachmentOption((option) =>
       option.setName("file").setDescription("The file to analyze").setRequired(true)
     ),
@@ -1687,9 +1999,11 @@ async function enqueueRequest(interaction, attachment) {
 // only the ticket owner can see and write in. The first
 // (top) message of the thread is a panel that says to wait
 // for a moderator, pings SUPPORT_NOTIFY_MOD_ID + the owner, and carries a
-// "Close Ticket" button that deletes the thread. Runtime state (panel message
-// id + open tickets) is persisted to supportData.json so restarts never
-// duplicate a panel or lose track of open tickets.
+// "Close Ticket" button. Closing a ticket archives & locks the private thread
+// (it is never deleted), builds a full transcript of the conversation, and DMs
+// the ticket creator an invoice with the transcript attached. Runtime state
+// (panel message id + open tickets) is persisted to supportData.json so
+// restarts never duplicate a panel or lose track of open tickets.
 const SUPPORT_PANEL_MANAGER_IDS = new Set(["1523184178567581817", "1280789307027755019"]); // who may run "/set module: Support Panel"
 const SUPPORT_ROLE_ID = "1522552781268058122"; // role that may press "Support" — or any role above it (hierarchy)
 // Staff role IDs used for the "Close Ticket" permission check. Members are no
@@ -1776,7 +2090,9 @@ async function findOpenTicket(guildId, userId) {
   const record = supportState.tickets?.[guildId]?.[userId];
   if (!record) return null;
   const thread = await client.channels.fetch(record.threadId, { force: true }).catch(() => null);
-  if (!thread) {
+  // Archived threads count as closed: since closing a ticket archives & locks
+  // it (never deletes), an archived record must not block a new ticket.
+  if (!thread || thread.archived) {
     delete supportState.tickets[guildId][userId];
     if (Object.keys(supportState.tickets[guildId]).length === 0) {
       delete supportState.tickets[guildId];
@@ -2145,6 +2461,87 @@ async function openSupportTicket(interaction, category) {
   }
 }
 
+// Build a plain-text transcript of every message in a thread (oldest first).
+// Used when a support ticket is closed: the transcript is attached to the
+// invoice DM sent to the ticket creator.
+async function buildThreadTranscript(thread) {
+  const MAX_TRANSCRIPT_MESSAGES = 2000;
+  const lines = [
+    "SUPPORT TICKET TRANSCRIPT",
+    `Thread: ${thread.name} (${thread.id})`,
+    `Generated: ${new Date().toUTCString()}`,
+    "========================================",
+  ];
+  let beforeId;
+  let total = 0;
+  let done = false;
+  while (!done) {
+    const fetched = await thread.messages.fetch({ limit: 100, before: beforeId });
+    const messages = [...fetched.values()].reverse(); // oldest -> newest
+    for (const message of messages) {
+      if (total >= MAX_TRANSCRIPT_MESSAGES) {
+        done = true;
+        break;
+      }
+      total += 1;
+      const timestamp = message.createdAt ? message.createdAt.toISOString() : "unknown time";
+      const author = message.author ? message.author.tag : "Unknown";
+      let line = `[${timestamp}] ${author}: ${message.content || ""}`;
+      if (message.attachments.size > 0) {
+        line +=
+          " " +
+          [...message.attachments.values()]
+            .map((attachment) => `[Attachment: ${attachment.name} — ${attachment.url}]`)
+            .join(" ");
+      }
+      if (message.embeds.length > 0) {
+        line +=
+          " [Embed: " +
+          message.embeds
+            .map((embed) => (embed.title || embed.description || "embed").slice(0, 200))
+            .filter(Boolean)
+            .join(" | ") +
+          "]";
+      }
+      lines.push(line);
+    }
+    beforeId = fetched.last()?.id;
+    if (fetched.size < 100) done = true;
+  }
+  return lines.join("\n");
+}
+
+// Invoice embed sent to the ticket creator's DMs when their ticket is closed.
+function buildInvoiceEmbed(record, category, thread, closedAt) {
+  const openedAt = record?.openedAt || closedAt;
+  return new EmbedBuilder()
+    .setColor(0x22c55e)
+    .setTitle("🧾 Support Ticket Invoice")
+    .setDescription(
+      "Your support ticket has been **closed**. Here is the invoice for your records — the full chat transcript is attached to this message."
+    )
+    .addFields(
+      { name: "🧾 Invoice No.", value: `\`${record?.ticketId || "—"}\``, inline: true },
+      {
+        name: "🗂 Category",
+        value: category ? `${category.emoji} ${category.label}` : "—",
+        inline: true,
+      },
+      { name: "👤 Customer", value: record?.username || "—", inline: true },
+      { name: "📅 Opened", value: `<t:${Math.floor(openedAt / 1000)}:f>`, inline: true },
+      { name: "📅 Closed", value: `<t:${Math.floor(closedAt / 1000)}:f>`, inline: true },
+      {
+        name: "⏱ Duration",
+        value: record ? formatDuration(closedAt - record.openedAt) : "—",
+        inline: true,
+      },
+      { name: "💬 Ticket Thread", value: thread ? `<#${thread.id}>` : "—", inline: true },
+      { name: "💰 Total", value: "No charge — free support session", inline: true }
+    )
+    .setFooter({ text: "Invoice generated automatically when the ticket was closed." })
+    .setTimestamp(closedAt);
+}
+
 async function handleSupportClose(interaction) {
   const thread = interaction.channel;
   const creatorId = (interaction.customId || "").split(":")[1];
@@ -2184,12 +2581,21 @@ async function handleSupportClose(interaction) {
 
     await interaction.editReply({ content: "🔒 Closing this ticket…" });
 
+    const closedAt = Date.now();
     const category = record ? categoryByValue(record.category) : null;
+
+    // 1. Build the transcript BEFORE the thread is locked/archived.
+    const transcriptText = await buildThreadTranscript(thread);
+    const transcriptFile = new AttachmentBuilder(Buffer.from(transcriptText, "utf8"), {
+      name: `ticket_transcript_${record?.ticketId || thread.id}.txt`,
+    });
+
+    // 2. Post the closing notice inside the ticket (must happen before locking).
     const closedEmbed = new EmbedBuilder()
       .setColor(0x6b7280)
       .setTitle("🔒 Ticket Closed")
       .setDescription(
-        `Your support ticket **${thread.name}** has been closed. Thanks for reaching out!`
+        `Your support ticket **${thread.name}** has been closed and archived. Thanks for reaching out!`
       )
       .addFields(
         { name: "🆔 Ticket", value: `\`${record?.ticketId || "—"}\``, inline: true },
@@ -2200,36 +2606,56 @@ async function handleSupportClose(interaction) {
         },
         {
           name: "⏱ Duration",
-          value: record ? formatDuration(Date.now() - record.openedAt) : "—",
+          value: record ? formatDuration(closedAt - record.openedAt) : "—",
           inline: true,
         }
       )
       .setFooter({ text: "Feel free to open a new ticket anytime if you need more help." });
+    await thread.send({ embeds: [closedEmbed] }).catch(() => {});
 
-    try {
-      await thread.delete(`Support ticket closed by ${interaction.user.tag}`);
-      console.log(`🗑️ Support ticket ${thread.id} closed by ${interaction.user.tag}`);
-      await interaction.editReply({ embeds: [closedEmbed] });
-    } catch (deleteError) {
-      // No permission to delete -> archive & lock as a fallback so the
-      // conversation is still closed and can't be written in anymore.
-      console.error(
-        `⚠️ Could not delete ticket ${thread.id}: ${deleteError.message} — archiving instead.`
-      );
+    // 3. DM the ticket creator: invoice embed + the transcript attached.
+    const invoiceEmbed = buildInvoiceEmbed(record, category, thread, closedAt);
+    let invoiceDelivered = false;
+    if (creatorId) {
       try {
-        await thread.setLocked(true);
-        await thread.setArchived(true);
-      } catch (_) {
-        /* ignore secondary failures */
+        const creator = await client.users.fetch(creatorId);
+        await creator.send({ embeds: [invoiceEmbed], files: [transcriptFile] });
+        invoiceDelivered = true;
+        console.log(
+          `🧾 Invoice + transcript DM sent to ${creator.tag} for ticket ${record?.ticketId || thread.id}`
+        );
+      } catch (dmError) {
+        console.warn(`⚠️ Could not DM invoice for ticket ${thread.id}: ${dmError.message}`);
       }
+    }
+    if (!invoiceDelivered) {
+      // DMs closed (or unknown creator): attach the transcript to the thread
+      // itself so the conversation is never lost.
+      await thread.send({ files: [transcriptFile] }).catch(() => {});
+    }
+
+    // 4. Archive & lock the thread — never delete it, the conversation stays.
+    try {
+      await thread.setLocked(true, `Support ticket closed by ${interaction.user.tag}`);
+      await thread.setArchived(true, `Support ticket closed by ${interaction.user.tag}`);
+      console.log(`🔒 Support ticket ${thread.id} archived & locked by ${interaction.user.tag}`);
+    } catch (archiveError) {
+      console.error(`⚠️ Could not archive ticket ${thread.id}: ${archiveError.message}`);
       await interaction
         .editReply({
           content:
-            "⚠️ The ticket could not be deleted, so it was archived instead. " +
-            "A moderator can delete it manually.",
+            "⚠️ The ticket could not be archived automatically. A moderator can archive it manually.",
         })
         .catch(() => {});
+      return;
     }
+
+    await interaction.editReply({
+      content: invoiceDelivered
+        ? "🧾 Invoice with full transcript sent to your DMs!"
+        : "🧾 Invoice couldn't be DM'd (DMs closed) — the transcript was attached to the ticket instead.",
+      embeds: [closedEmbed],
+    });
   } catch (error) {
     console.error("❌ Failed to close support ticket:", error.message);
     await interaction
@@ -2256,6 +2682,283 @@ client.once(Events.ClientReady, async () => {
   await pruneStaleTickets().catch((error) =>
     console.error("❌ Support ticket cleanup failed:", error.message)
   );
+  // Report every server that hasn't been security-logged yet. Runs after ready
+  // so every guild and its channels are fully loaded.
+  backfillSecurityLogs().catch((error) =>
+    console.error("❌ Security log backfill failed:", error.message)
+  );
+});
+
+// ---- Server security log ---------------------------------------------------
+// Whenever a server adds the bot, a full security log about that server is
+// posted to SECURITY_LOG_CHANNEL_ID in every server the bot shares that has
+// that channel. Every log carries a permanent invite link (never expires) to
+// the newly added server. Guilds are recorded in securityLogState.json so a
+// restart never re-logs servers that were already reported.
+const SECURITY_LOG_CHANNEL_ID = "1522556287391371294";
+const SECURITY_LOG_STATE_FILE = path.join(__dirname, "securityLogState.json");
+
+function loadSecurityLogState() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SECURITY_LOG_STATE_FILE, "utf8"));
+    return new Set(Array.isArray(parsed?.loggedGuilds) ? parsed.loggedGuilds : []);
+  } catch {
+    return new Set(); // no file yet or unreadable -> start empty
+  }
+}
+
+function saveSecurityLogState() {
+  try {
+    fs.writeFileSync(
+      SECURITY_LOG_STATE_FILE,
+      JSON.stringify({ loggedGuilds: [...securityLoggedGuilds] }, null, 2)
+    );
+  } catch (error) {
+    console.error("⚠️ Failed to save security log state:", error.message);
+  }
+}
+
+const securityLoggedGuilds = loadSecurityLogState();
+// Guilds currently being reported (prevents duplicate concurrent sends).
+const securityLogInFlight = new Set();
+
+function verificationLevelLabel(level) {
+  const labels = { 0: "None", 1: "Low", 2: "Medium", 3: "High", 4: "Very High" };
+  return labels[level] ?? String(level ?? "?");
+}
+
+const CHANNEL_TYPE_LABELS = {
+  [ChannelType.GuildText]: "📝 Text",
+  [ChannelType.GuildVoice]: "🔊 Voice",
+  [ChannelType.GuildCategory]: "🗂 Category",
+  [ChannelType.GuildAnnouncement]: "📢 Announcement",
+  [ChannelType.AnnouncementThread]: "📌 Announcement thread",
+  [ChannelType.PublicThread]: "💬 Public thread",
+  [ChannelType.PrivateThread]: "🔒 Private thread",
+  [ChannelType.GuildStageVoice]: "🎭 Stage",
+  [ChannelType.GuildForum]: "📋 Forum",
+  [ChannelType.GuildDirectory]: "🧭 Directory",
+  [ChannelType.GuildMedia]: "🖼 Media",
+};
+
+function channelTypeLabel(type) {
+  return CHANNEL_TYPE_LABELS[type] || "❓ Other";
+}
+
+// One line per channel type, e.g. "📝 Text: 4".
+function countChannelsByType(guild) {
+  const counts = new Map();
+  for (const channel of guild.channels.cache.values()) {
+    const label = channelTypeLabel(channel.type);
+    counts.set(label, (counts.get(label) || 0) + 1);
+  }
+  const summary = [...counts.entries()].map(([label, count]) => `${label}: ${count}`).join("\n");
+  return summary || "No channels";
+}
+
+// Full, complete snapshot of the server that just added the bot.
+async function buildSecurityLogEmbed(guild) {
+  const owner = await guild.fetchOwner().catch(() => null);
+  const topRole = [...guild.roles.cache.values()]
+    .filter((role) => role.id !== guild.id) // skip @everyone
+    .sort((a, b) => b.position - a.position)[0];
+  const features =
+    (guild.features || [])
+      .map((feature) => `\`${feature}\``)
+      .join(", ")
+      .slice(0, 1000) || "None";
+
+  return new EmbedBuilder()
+    .setColor(0xef4444)
+    .setTitle("🛡️ Security Log — Bot Added to Server")
+    .setDescription("The bot was just added to a new server. Full server details below.")
+    .setThumbnail(guild.iconURL({ size: 256 }))
+    .addFields(
+      { name: "🏷️ Server", value: guild.name || "Unknown", inline: true },
+      { name: "🆔 Server ID", value: `\`${guild.id}\``, inline: true },
+      {
+        name: "👑 Owner",
+        value: owner ? `${owner.user.tag} (\`${owner.id}\`)` : `\`${guild.ownerId}\``,
+        inline: true,
+      },
+      {
+        name: "📅 Server Created",
+        value: guild.createdTimestamp ? `<t:${Math.floor(guild.createdTimestamp / 1000)}:f>` : "—",
+        inline: true,
+      },
+      {
+        name: "🤖 Bot Joined",
+        value: guild.joinedTimestamp ? `<t:${Math.floor(guild.joinedTimestamp / 1000)}:f>` : "—",
+        inline: true,
+      },
+      { name: "👥 Members", value: String(guild.memberCount ?? "?"), inline: true },
+      {
+        name: "🚀 Boosts",
+        value: `${guild.premiumSubscriptionCount ?? 0} boost(s) · Tier ${guild.premiumTier ?? 0}`,
+        inline: true,
+      },
+      {
+        name: "🔐 Verification Level",
+        value: verificationLevelLabel(guild.verificationLevel),
+        inline: true,
+      },
+      {
+        name: "🎭 Roles",
+        value: `${guild.roles.cache.size} role(s)${topRole ? ` · Top: ${topRole.name}` : ""}`,
+        inline: true,
+      },
+      { name: "📚 Channels", value: countChannelsByType(guild), inline: false },
+      { name: "⭐ Features", value: features, inline: false }
+    )
+    .setFooter({ text: "🛡️ Security log • bot added to server" })
+    .setTimestamp();
+}
+
+// Try to create a permanent invite (no expiry, unlimited uses) for the server.
+async function createPermanentInvite(guild) {
+  const candidates = [];
+  if (guild.systemChannel) candidates.push(guild.systemChannel);
+  for (const channel of guild.channels.cache.values()) {
+    if (
+      (channel.type === ChannelType.GuildText || channel.type === ChannelType.GuildAnnouncement) &&
+      !candidates.some((candidate) => candidate.id === channel.id)
+    ) {
+      candidates.push(channel);
+    }
+  }
+  for (const channel of candidates) {
+    // Skip channels the bot can't create invites in without burning a REST
+    // call — keeps the log fast so it goes out immediately after a join.
+    if (!channel.permissionsFor(client.user.id)?.has(PermissionFlagsBits.CreateInstantInvite)) {
+      continue;
+    }
+    try {
+      const invite = await channel.createInvite({
+        maxAge: 0, // 0 = never expires
+        maxUses: 0, // 0 = unlimited uses
+        reason: `Security log: permanent invite for ${guild.name}`,
+      });
+      return `https://discord.gg/${invite.code}`;
+    } catch {
+      // No permission in this channel -> try the next candidate.
+    }
+  }
+  return null;
+}
+
+// Post the security log for a newly added server to SECURITY_LOG_CHANNEL_ID.
+// A Discord channel ID is globally unique, so the target channel lives in
+// exactly one server — fetch it directly and send there. Returns true when the
+// log was delivered. The guild is only recorded as "logged" AFTER a successful
+// delivery, so a temporary failure (missing permission, channel not visible,
+// bot still connecting on startup) never permanently suppresses the report; it
+// is retried on the next restart / backfill pass.
+async function sendSecurityLog(guild) {
+  if (securityLoggedGuilds.has(guild.id)) {
+    console.log(
+      `🛡️ Skipping security log for "${guild.name}" (${guild.id}) — already reported (see securityLogState.json).`
+    );
+    return false;
+  }
+  if (securityLogInFlight.has(guild.id)) {
+    console.log(
+      `🛡️ Security log for "${guild.name}" (${guild.id}) already in progress — skipping.`
+    );
+    return false;
+  }
+  securityLogInFlight.add(guild.id);
+  try {
+    const embed = await buildSecurityLogEmbed(guild);
+    const invite = await createPermanentInvite(guild);
+    const content = invite
+      ? `🔗 **Permanent invite (no expiry):** ${invite}`
+      : "⚠️ Could not create a permanent invite for this server (missing permission).";
+
+    // A channel ID exists in exactly one server — fetch it directly so we also
+    // learn which server it belongs to and can check permissions accurately.
+    const channel = await client.channels.fetch(SECURITY_LOG_CHANNEL_ID).catch(() => null);
+    if (!channel) {
+      console.warn(
+        `🛡️ Security log NOT delivered for "${guild.name}" (${guild.id}): channel ${SECURITY_LOG_CHANNEL_ID} was not found or the bot can't see it. Check the channel ID and that the bot has View Channel permission on it.`
+      );
+      return false;
+    }
+    if (!channel.isTextBased()) {
+      console.warn(
+        `🛡️ Security log NOT delivered for "${guild.name}" (${guild.id}): channel ${SECURITY_LOG_CHANNEL_ID} exists but is not a text channel (type ${channel.type}).`
+      );
+      return false;
+    }
+
+    const perms = channel.permissionsFor(client.user.id);
+    const canView = perms?.has(PermissionFlagsBits.ViewChannel) ?? false;
+    const canSend = perms?.has(PermissionFlagsBits.SendMessages) ?? false;
+    if (!canView || !canSend) {
+      console.warn(
+        `🛡️ Security log NOT delivered for "${guild.name}" (${guild.id}): the bot lacks ` +
+          `${!canView ? "View Channel" : ""}${!canView && !canSend ? " and " : ""}${!canSend ? "Send Messages" : ""} ` +
+          `on #${channel.name} in ${channel.guild?.name ?? "?"}.`
+      );
+      return false;
+    }
+
+    await channel.send({ content, embeds: [embed] });
+    securityLoggedGuilds.add(guild.id);
+    saveSecurityLogState();
+    console.log(
+      `🛡️ Security log sent for new server "${guild.name}" (${guild.id}) to #${channel.name} in ${channel.guild?.name ?? "?"}.`
+    );
+    return true;
+  } catch (error) {
+    console.warn(
+      `🛡️ Security log NOT delivered for "${guild.name}" (${guild.id}): ${error.message}`
+    );
+    return false;
+  } finally {
+    securityLogInFlight.delete(guild.id);
+  }
+}
+
+// Report every server the bot already shares that has not been reported yet.
+// GuildCreate also fires for these on startup, but running this pass after
+// ready guarantees every guild + its channels are fully loaded, so the target
+// log channel is always findable and nothing is skipped due to startup timing.
+async function backfillSecurityLogs() {
+  let reported = 0;
+  for (const guild of client.guilds.cache.values()) {
+    if (securityLoggedGuilds.has(guild.id)) continue;
+    try {
+      if (await sendSecurityLog(guild)) reported += 1;
+    } catch (error) {
+      console.error(`❌ Security log failed for ${guild.name} (${guild.id}):`, error.message);
+    }
+  }
+  console.log(`🛡️ Security log backfill finished: ${reported} new server(s) reported.`);
+}
+
+// A server just added the bot while the bot was running -> report it RIGHT NOW,
+// no restart needed. (If the bot is offline when it's added, the next startup's
+// backfill pass reports it as soon as the bot comes online.)
+client.on(Events.GuildCreate, (guild) => {
+  if (!guild || guild.unavailable) return;
+  console.log(
+    `🛡️ Bot added to server "${guild.name}" (${guild.id}) — sending security log now (no restart needed).`
+  );
+  sendSecurityLog(guild).catch((error) =>
+    console.error(`❌ Security log failed for ${guild.name} (${guild.id}):`, error.message)
+  );
+});
+
+// If the bot is removed from a server, forget it so a future re-invite is
+// security-logged again ("every time someone adds the bot, it logs").
+client.on(Events.GuildDelete, (guild) => {
+  if (!guild) return;
+  if (securityLoggedGuilds.delete(guild.id)) {
+    saveSecurityLogState();
+    console.log(
+      `🛡️ Bot removed from "${guild.name || guild.id}" (${guild.id}) — it will be logged again if re-invited.`
+    );
+  }
 });
 
 // Handle slash command interactions
@@ -2470,7 +3173,7 @@ const HELP_TEXT =
   "`/status` - Check bot status (latency, CPU, RAM, uptime)\n" +
   "`/set` - Turn this channel into a Nexora AI chat channel or post the Support Panel\n" +
   "`/newtask` - Forget the current Nexora AI chat and start fresh\n" +
-  "`/analyze` - Analyze any file (image, mp4, mp3, PDF, Word, PPTX, Excel, code...)\n" +
+  "`/analyze` - Analyze almost any file: images, video, audio, PDF, Office docs, and any text/code file\n" +
   "`/imagine` - Generate an image from a description; attach a reference image to edit it\n" +
   "💡 In an AI chat channel (`/set`) you can also just attach a file with your " +
   "message and Nexora will analyze it, write e.g. `buatkan gambar kucing` to " +
@@ -2619,7 +3322,7 @@ function extractFileUrls(text) {
       const pathname = new URL(raw).pathname;
       const name = decodeURIComponent(pathname.split("/").pop() || "");
       const ext = path.extname(name).slice(1).toLowerCase();
-      if (name && (TEXT_FILE_EXTENSIONS.has(ext) || EXTENSION_MIME[ext])) {
+      if (name && (TEXT_FILE_EXTENSIONS.has(ext) || EXTENSION_MIME[ext] || EXTENSION_MIME_TRANSCODE[ext])) {
         found.push({ name, url: raw });
       }
     } catch {
@@ -2649,6 +3352,7 @@ async function analyzeFileLinksInChat(message, text) {
       size: 0,
       contentType:
         EXTENSION_MIME[path.extname(ref.name).slice(1).toLowerCase()] ||
+        EXTENSION_MIME_TRANSCODE[path.extname(ref.name).slice(1).toLowerCase()] ||
         "application/octet-stream",
       url: ref.url,
     }));
@@ -2741,7 +3445,7 @@ client.on("messageCreate", async (message) => {
             ? `🎨 Edited from your image${referenceParts.length > 1 ? "s" : ""}! **${prompt}**`
             : `🎨 Here you go! **${prompt}**`;
         await message.reply({ content: caption, files: [file] });
-        if (model !== IMAGE_MODELS[0]) {
+        if (model && model.startsWith("gemini") && model !== IMAGE_MODELS[0]) {
           console.log(`🎨 Nexora generated an image with fallback model: ${model}`);
         }
         return;

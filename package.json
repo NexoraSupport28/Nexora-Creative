@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@imgly/background-removal-node": "^1.4.3",
+    "adm-zip": "^0.6.0",
     "axios": "^1.20.0",
     "discord.js": "^14.14.1",
     "dotenv": "^16.3.1",
